@@ -8,9 +8,13 @@ import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.file.FileSystems;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.nio.file.attribute.FileAttribute;
+import java.nio.file.attribute.PosixFilePermission;
+import java.nio.file.attribute.PosixFilePermissions;
 import java.util.EnumSet;
 import java.util.HashSet;
 import java.util.Locale;
@@ -87,6 +91,9 @@ final class OnnxRuntime {
   /** The short name of the WebGPU DXC library "dxcompiler.dll" */
   static final String ONNXRUNTIME_LIBRARY_WEBGPU_DXC_DXCOMPILER_NAME = "dxcompiler";
 
+  /** The default value used when a system property is not set */
+  private static final String DEFAULT_PROPERTY_VALUE = "generic";
+
   /** The OS & CPU architecture string */
   private static final String OS_ARCH_STR = initOsArch();
 
@@ -125,7 +132,7 @@ final class OnnxRuntime {
   /* Computes and initializes OS_ARCH_STR (such as linux-x64) */
   private static String initOsArch() {
     String detectedOS = null;
-    String os = System.getProperty("os.name", "generic").toLowerCase(Locale.ENGLISH);
+    String os = System.getProperty("os.name", DEFAULT_PROPERTY_VALUE).toLowerCase(Locale.ENGLISH);
     if (os.contains("mac") || os.contains("darwin")) {
       detectedOS = "osx";
     } else if (os.contains("win")) {
@@ -138,7 +145,7 @@ final class OnnxRuntime {
       throw new IllegalStateException("Unsupported os:" + os);
     }
     String detectedArch = null;
-    String arch = System.getProperty("os.arch", "generic").toLowerCase(Locale.ENGLISH);
+    String arch = System.getProperty("os.arch", DEFAULT_PROPERTY_VALUE).toLowerCase(Locale.ENGLISH);
     if (arch.startsWith("amd64") || arch.startsWith("x86_64")) {
       detectedArch = "x64";
     } else if (arch.startsWith("x86")) {
@@ -168,7 +175,7 @@ final class OnnxRuntime {
     if (loaded) {
       return;
     }
-    tempDirectory = isAndroid() ? null : Files.createTempDirectory("onnxruntime-java");
+    tempDirectory = isAndroid() ? null : createSecureTempDirectory("onnxruntime-java");
     try {
       libraryDirPathProperty = System.getProperty(ONNXRUNTIME_NATIVE_PATH);
       // Extract and prepare the shared provider library but don't try to load it,
@@ -201,6 +208,33 @@ final class OnnxRuntime {
         cleanUp(tempDirectory.toFile());
       }
     }
+  }
+
+  /**
+   * Creates a temporary directory which is only accessible by the current user.
+   *
+   * @param prefix The directory name prefix.
+   * @return The path to the created directory.
+   * @throws IOException If the directory could not be created.
+   */
+  private static Path createSecureTempDirectory(String prefix) throws IOException {
+    if (FileSystems.getDefault().supportedFileAttributeViews().contains("posix")) {
+      FileAttribute<Set<PosixFilePermission>> attr =
+          PosixFilePermissions.asFileAttribute(PosixFilePermissions.fromString("rwx------"));
+      return Files.createTempDirectory(prefix, attr);
+    }
+    Path baseDir = Paths.get(System.getProperty("java.io.tmpdir"));
+    Path dir = Files.createTempDirectory(baseDir, prefix);
+    File dirFile = dir.toFile();
+    // Best effort restriction to the owner on non-POSIX file systems.
+    boolean restricted =
+        dirFile.setReadable(true, true)
+            && dirFile.setWritable(true, true)
+            && dirFile.setExecutable(true, true);
+    if (!restricted) {
+      logger.log(Level.FINE, "Failed to restrict permissions on {0}", dir);
+    }
+    return dir;
   }
 
   /**
@@ -328,7 +362,7 @@ final class OnnxRuntime {
    * @return True if the property java.vendor equals The Android Project, false otherwise.
    */
   static boolean isAndroid() {
-    return System.getProperty("java.vendor", "generic").equals("The Android Project");
+    return System.getProperty("java.vendor", DEFAULT_PROPERTY_VALUE).equals("The Android Project");
   }
 
   /**
