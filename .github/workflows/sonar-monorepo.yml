@@ -1,0 +1,68 @@
+name: SonarCloud monorepo scan
+
+on:
+  push:
+    branches: [main]
+    paths: ['java/**', 'go/**', 'js/**', '.github/workflows/sonar-monorepo.yml']
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths: ['java/**', 'go/**', 'js/**', '.github/workflows/sonar-monorepo.yml']
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  sonar:
+    name: scan-${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: java
+            dir: java
+            key: onnxruntime-monorepo-Java
+            args: >-
+              -Dsonar.sources=src/main
+              -Dsonar.tests=src/test
+              -Dsonar.java.binaries=build/classes
+          - name: go
+            dir: go
+            key: onnxruntime-monorepo-Golang
+            args: >-
+              -Dsonar.sources=.
+              -Dsonar.exclusions=**/*_test.go,testdata/**
+              -Dsonar.tests=.
+              -Dsonar.test.inclusions=**/*_test.go
+          - name: js
+            dir: js
+            key: onnxruntime-monorepo-JS
+            args: >-
+              -Dsonar.sources=common/lib,node/lib,web/lib,react_native/lib
+              -Dsonar.tests=common/test,node/test,web/test
+              -Dsonar.exclusions=**/node_modules/**,**/dist/**
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - if: matrix.name == 'java'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - if: matrix.name == 'java'
+        working-directory: java
+        run: ./gradlew compileJava -x test --no-daemon
+
+      - uses: SonarSource/sonarqube-scan-action@v6
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        with:
+          projectBaseDir: ${{ matrix.dir }}
+          args: >
+            -Dsonar.organization=gh-sonar-io
+            -Dsonar.projectKey=${{ matrix.key }}
+            ${{ matrix.args }}
