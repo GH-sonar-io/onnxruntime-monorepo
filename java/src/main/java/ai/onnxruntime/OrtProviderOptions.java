@@ -105,37 +105,26 @@ public abstract class OrtProviderOptions implements AutoCloseable {
   protected static long loadLibraryAndCreate(
       OrtProvider provider, OrtProviderSupplier createFunction) throws OrtException {
     // Shared providers need their libraries loaded before options can be defined.
-    switch (provider) {
-      case CUDA:
-        if (!OnnxRuntime.extractCUDA()) {
-          throw new OrtException(
-              OrtException.OrtErrorCode.ORT_EP_FAIL, "Failed to find CUDA shared provider");
-        }
-        break;
-      case DNNL:
-        if (!OnnxRuntime.extractDNNL()) {
-          throw new OrtException(
-              OrtException.OrtErrorCode.ORT_EP_FAIL, "Failed to find DNNL shared provider");
-        }
-        break;
-      case OPEN_VINO:
-        if (!OnnxRuntime.extractOpenVINO()) {
-          throw new OrtException(
-              OrtException.OrtErrorCode.ORT_EP_FAIL, "Failed to find OpenVINO shared provider");
-        }
-        break;
-      case ROCM:
-        if (!OnnxRuntime.extractROCM()) {
-          throw new OrtException(
-              OrtException.OrtErrorCode.ORT_EP_FAIL, "Failed to find ROCm shared provider");
-        }
-        break;
-      case TENSOR_RT:
-        if (!OnnxRuntime.extractTensorRT()) {
-          throw new OrtException(
-              OrtException.OrtErrorCode.ORT_EP_FAIL, "Failed to find TensorRT shared provider");
-        }
-        break;
+    // Other providers do not need a shared library loaded before creating options.
+    if (provider == OrtProvider.CUDA && !OnnxRuntime.extractCUDA()) {
+      throw new OrtException(
+          OrtException.OrtErrorCode.ORT_EP_FAIL, "Failed to find CUDA shared provider");
+    }
+    if (provider == OrtProvider.DNNL && !OnnxRuntime.extractDNNL()) {
+      throw new OrtException(
+          OrtException.OrtErrorCode.ORT_EP_FAIL, "Failed to find DNNL shared provider");
+    }
+    if (provider == OrtProvider.OPEN_VINO && !OnnxRuntime.extractOpenVINO()) {
+      throw new OrtException(
+          OrtException.OrtErrorCode.ORT_EP_FAIL, "Failed to find OpenVINO shared provider");
+    }
+    if (provider == OrtProvider.ROCM && !OnnxRuntime.extractROCM()) {
+      throw new OrtException(
+          OrtException.OrtErrorCode.ORT_EP_FAIL, "Failed to find ROCm shared provider");
+    }
+    if (provider == OrtProvider.TENSOR_RT && !OnnxRuntime.extractTensorRT()) {
+      throw new OrtException(
+          OrtException.OrtErrorCode.ORT_EP_FAIL, "Failed to find TensorRT shared provider");
     }
 
     return createFunction.create();

@@ -357,82 +357,108 @@ public class OrtSession implements AutoCloseable {
       Map<String, ? extends OnnxValue> pinnedOutputs,
       RunOptions runOptions)
       throws OrtException {
-    if (!closed) {
-      if ((inputs.isEmpty() && (numInputs != 0)) || (inputs.size() > numInputs)) {
-        throw new OrtException(
-            "Unexpected number of inputs, expected [1," + numInputs + ") found " + inputs.size());
-      }
-      int totalOutputs = requestedOutputs.size() + pinnedOutputs.size();
-      if ((totalOutputs == 0) || (totalOutputs > numOutputs)) {
-        throw new OrtException(
-            "Unexpected number of requestedOutputs & pinnedOutputs, expected [1,"
-                + numOutputs
-                + ") found "
-                + totalOutputs);
-      }
-      String[] inputNamesArray = new String[inputs.size()];
-      long[] inputHandles = new long[inputs.size()];
-      int i = 0;
-      for (Map.Entry<String, ? extends OnnxTensorLike> t : inputs.entrySet()) {
-        if (inputNames.contains(t.getKey())) {
-          inputNamesArray[i] = t.getKey();
-          inputHandles[i] = t.getValue().getNativeHandle();
-          i++;
-        } else {
-          throw new OrtException(
-              "Unknown input name " + t.getKey() + ", expected one of " + inputNames.toString());
-        }
-      }
-      String[] outputNamesArray = new String[requestedOutputs.size() + pinnedOutputs.size()];
-      OnnxValue[] outputValues = new OnnxValue[outputNamesArray.length];
-      long[] outputHandles = new long[outputNamesArray.length];
-      i = 0;
-      for (Map.Entry<String, ? extends OnnxValue> e : pinnedOutputs.entrySet()) {
-        if (outputNames.contains(e.getKey())) {
-          outputNamesArray[i] = e.getKey();
-          outputValues[i] = e.getValue();
-          outputHandles[i] = getHandle(e.getValue());
-          i++;
-        } else {
-          throw new OrtException(
-              "Unknown output name " + e.getKey() + ", expected one of " + outputNames.toString());
-        }
-      }
-      for (String s : requestedOutputs) {
-        if (outputNames.contains(s)) {
-          if (!pinnedOutputs.containsKey(s)) {
-            outputNamesArray[i] = s;
-            // outputValues and outputHandles can be null/0 for these outputs as ORT will allocate
-            // them.
-            i++;
-          } else {
-            throw new OrtException(
-                "Output '"
-                    + s
-                    + "' was found in both the requested outputs and the pinned outputs");
-          }
-        } else {
-          throw new OrtException(
-              "Unknown output name " + s + ", expected one of " + outputNames.toString());
-        }
-      }
-      long runOptionsHandle = runOptions == null ? 0 : runOptions.getNativeHandle();
-      boolean[] ownedByResult =
-          run(
-              OnnxRuntime.ortApiHandle,
-              nativeHandle,
-              allocator.handle,
-              inputNamesArray,
-              inputHandles,
-              inputNamesArray.length,
-              outputNamesArray,
-              outputNamesArray.length,
-              outputValues,
-              outputHandles,
-              runOptionsHandle);
-      return new Result(outputNamesArray, outputValues, ownedByResult);
-    } else {
+    if (closed) {
       throw new IllegalStateException("Trying to score a closed OrtSession.");
+    }
+    validateCounts(inputs, requestedOutputs, pinnedOutputs);
+    String[] inputNamesArray = new String[inputs.size()];
+    long[] inputHandles = new long[inputs.size()];
+    fillInputs(inputs, inputNamesArray, inputHandles);
+    String[] outputNamesArray = new String[requestedOutputs.size() + pinnedOutputs.size()];
+    OnnxValue[] outputValues = new OnnxValue[outputNamesArray.length];
+    long[] outputHandles = new long[outputNamesArray.length];
+    int i = fillPinnedOutputs(pinnedOutputs, outputNamesArray, outputValues, outputHandles);
+    fillRequestedOutputs(requestedOutputs, pinnedOutputs, outputNamesArray, i);
+    long runOptionsHandle = runOptions == null ? 0 : runOptions.getNativeHandle();
+    boolean[] ownedByResult =
+        run(
+            OnnxRuntime.ortApiHandle,
+            nativeHandle,
+            allocator.handle,
+            inputNamesArray,
+            inputHandles,
+            inputNamesArray.length,
+            outputNamesArray,
+            outputNamesArray.length,
+            outputValues,
+            outputHandles,
+            runOptionsHandle);
+    return new Result(outputNamesArray, outputValues, ownedByResult);
+  }
+
+  private void validateCounts(
+      Map<String, ? extends OnnxTensorLike> inputs,
+      Set<String> requestedOutputs,
+      Map<String, ? extends OnnxValue> pinnedOutputs)
+      throws OrtException {
+    if ((inputs.isEmpty() && (numInputs != 0)) || (inputs.size() > numInputs)) {
+      throw new OrtException(
+          "Unexpected number of inputs, expected [1," + numInputs + ") found " + inputs.size());
+    }
+    int totalOutputs = requestedOutputs.size() + pinnedOutputs.size();
+    if ((totalOutputs == 0) || (totalOutputs > numOutputs)) {
+      throw new OrtException(
+          "Unexpected number of requestedOutputs & pinnedOutputs, expected [1,"
+              + numOutputs
+              + ") found "
+              + totalOutputs);
+    }
+  }
+
+  private void fillInputs(
+      Map<String, ? extends OnnxTensorLike> inputs, String[] inputNamesArray, long[] inputHandles)
+      throws OrtException {
+    int i = 0;
+    for (Map.Entry<String, ? extends OnnxTensorLike> t : inputs.entrySet()) {
+      if (!inputNames.contains(t.getKey())) {
+        throw new OrtException(
+            "Unknown input name " + t.getKey() + ", expected one of " + inputNames.toString());
+      }
+      inputNamesArray[i] = t.getKey();
+      inputHandles[i] = t.getValue().getNativeHandle();
+      i++;
+    }
+  }
+
+  private int fillPinnedOutputs(
+      Map<String, ? extends OnnxValue> pinnedOutputs,
+      String[] outputNamesArray,
+      OnnxValue[] outputValues,
+      long[] outputHandles)
+      throws OrtException {
+    int i = 0;
+    for (Map.Entry<String, ? extends OnnxValue> e : pinnedOutputs.entrySet()) {
+      if (!outputNames.contains(e.getKey())) {
+        throw new OrtException(
+            "Unknown output name " + e.getKey() + ", expected one of " + outputNames.toString());
+      }
+      outputNamesArray[i] = e.getKey();
+      outputValues[i] = e.getValue();
+      outputHandles[i] = getHandle(e.getValue());
+      i++;
+    }
+    return i;
+  }
+
+  private void fillRequestedOutputs(
+      Set<String> requestedOutputs,
+      Map<String, ? extends OnnxValue> pinnedOutputs,
+      String[] outputNamesArray,
+      int startIndex)
+      throws OrtException {
+    int i = startIndex;
+    for (String s : requestedOutputs) {
+      if (!outputNames.contains(s)) {
+        throw new OrtException(
+            "Unknown output name " + s + ", expected one of " + outputNames.toString());
+      }
+      if (pinnedOutputs.containsKey(s)) {
+        throw new OrtException(
+            "Output '" + s + "' was found in both the requested outputs and the pinned outputs");
+      }
+      outputNamesArray[i] = s;
+      // outputValues and outputHandles can be null/0 for these outputs as ORT will allocate them.
+      i++;
     }
   }
 
@@ -583,6 +609,7 @@ public class OrtSession implements AutoCloseable {
    * @return A boolean array representing if the OnnxValues were allocated by this run call.
    * @throws OrtException If the native call failed in some way.
    */
+  @SuppressWarnings("java:S107") // Mirrors the JNI signature implemented in native code.
   private native boolean[] run(
       long apiHandle,
       long nativeHandle,
