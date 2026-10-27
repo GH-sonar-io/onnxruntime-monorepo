@@ -1,6 +1,7 @@
 name: SonarCloud monorepo scan
 
 on:
+  workflow_dispatch:
   push:
     branches: [main]
     paths: ['java/**', 'go/**', 'js/**', '.github/workflows/sonar-monorepo.yml']
