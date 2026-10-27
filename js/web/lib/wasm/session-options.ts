@@ -70,6 +70,151 @@ const appendEpOption = (epOptions: Array<[number, number]>, key: string, value: 
   epOptions.push([keyDataOffset, valueDataOffset]);
 };
 
+type ExecutionProviderConfig = NonNullable<InferenceSession.SessionOptions['executionProviders']>[number];
+
+const setWebNNOptions = (sessionOptionsHandle: number, ep: ExecutionProviderConfig, allocs: number[]): void => {
+  // Disable QDQ fusion so DQ/Q nodes are preserved as individual ops for WebNN EP.
+  appendSessionConfig(sessionOptionsHandle, 'session.disable_quant_qdq', '1', allocs);
+  // Forcibly prevent constant folding from replacing DQ nodes with constants.
+  appendSessionConfig(sessionOptionsHandle, 'session.disable_qdq_constant_folding', '1', allocs);
+  if (typeof ep !== 'string') {
+    const webnnOptions = ep as InferenceSession.WebNNExecutionProviderOption;
+    // const context = (webnnOptions as InferenceSession.WebNNOptionsWithMLContext)?.context;
+    const deviceType = (webnnOptions as InferenceSession.WebNNContextOptions)?.deviceType;
+    if (deviceType) {
+      appendSessionConfig(sessionOptionsHandle, 'deviceType', deviceType, allocs);
+    }
+  }
+};
+
+const getWebGpuCustomDevice = (
+  webgpuOptions: InferenceSession.WebGpuExecutionProviderOption,
+): GPUDevice | undefined => {
+  if (!webgpuOptions.device) {
+    return undefined;
+  }
+  if (typeof GPUDevice !== 'undefined' && webgpuOptions.device instanceof GPUDevice) {
+    return webgpuOptions.device;
+  }
+  throw new Error('Invalid GPU device set in WebGPU EP options.');
+};
+
+const appendWebGpuGeneralOptions = (
+  webgpuOptions: InferenceSession.WebGpuExecutionProviderOption,
+  sessionOptions: InferenceSession.SessionOptions,
+  epOptions: Array<[number, number]>,
+  allocs: number[],
+): void => {
+  // set graph capture option from session options
+  const { enableGraphCapture } = sessionOptions;
+  if (typeof enableGraphCapture === 'boolean' && enableGraphCapture) {
+    appendEpOption(epOptions, 'enableGraphCapture', '1', allocs);
+  }
+
+  // set layout option
+  if (typeof webgpuOptions.preferredLayout === 'string') {
+    appendEpOption(epOptions, 'preferredLayout', webgpuOptions.preferredLayout, allocs);
+  }
+
+  // set force CPU fallback nodes
+  if (webgpuOptions.forceCpuNodeNames) {
+    const names = Array.isArray(webgpuOptions.forceCpuNodeNames)
+      ? webgpuOptions.forceCpuNodeNames
+      : [webgpuOptions.forceCpuNodeNames];
+
+    appendEpOption(epOptions, 'forceCpuNodeNames', names.join('\n'), allocs);
+  }
+
+  // set validation mode
+  if (webgpuOptions.validationMode) {
+    appendEpOption(epOptions, 'validationMode', webgpuOptions.validationMode, allocs);
+  }
+
+  // set f32 accumulation for the MatMulNBits kernels
+  if (typeof webgpuOptions.enableMatmulFp32Accumulation === 'boolean') {
+    appendEpOption(
+      epOptions,
+      'enableMatmulFp32Accumulation',
+      webgpuOptions.enableMatmulFp32Accumulation ? '1' : '0',
+      allocs,
+    );
+  }
+};
+
+const appendWebGpuBufferCacheModes = (
+  webgpuOptions: InferenceSession.WebGpuExecutionProviderOption,
+  epOptions: Array<[number, number]>,
+  allocs: number[],
+): void => {
+  for (const key of [
+    'storageBufferCacheMode',
+    'uniformBufferCacheMode',
+    'queryResolveBufferCacheMode',
+    'defaultBufferCacheMode',
+  ] as const) {
+    const mode = webgpuOptions[key];
+    if (mode) {
+      if (mode !== 'disabled' && mode !== 'lazyRelease' && mode !== 'simple' && mode !== 'bucket') {
+        throw new Error(`${key} must be one of 'disabled', 'lazyRelease', 'simple' or 'bucket': ${mode}`);
+      }
+      appendEpOption(epOptions, key, mode, allocs);
+    }
+  }
+};
+
+const setWebGpuOptions = (
+  ep: ExecutionProviderConfig,
+  sessionOptions: InferenceSession.SessionOptions,
+  epOptions: Array<[number, number]>,
+  allocs: number[],
+): void => {
+  let customDevice: GPUDevice | undefined;
+
+  if (typeof ep !== 'string') {
+    const webgpuOptions = ep as InferenceSession.WebGpuExecutionProviderOption;
+    customDevice = getWebGpuCustomDevice(webgpuOptions);
+    appendWebGpuGeneralOptions(webgpuOptions, sessionOptions, epOptions, allocs);
+    appendWebGpuBufferCacheModes(webgpuOptions, epOptions, allocs);
+  }
+
+  const info = getInstance().webgpuRegisterDevice!(customDevice);
+  if (info) {
+    const [deviceId, instanceHandle, deviceHandle] = info;
+    appendEpOption(epOptions, 'deviceId', deviceId.toString(), allocs);
+    appendEpOption(epOptions, 'webgpuInstance', instanceHandle.toString(), allocs);
+    appendEpOption(epOptions, 'webgpuDevice', deviceHandle.toString(), allocs);
+  }
+};
+
+const setJsepOptions = (sessionOptionsHandle: number, ep: ExecutionProviderConfig, allocs: number[]): void => {
+  if (typeof ep === 'string') {
+    return;
+  }
+  const webgpuOptions = ep as InferenceSession.WebGpuExecutionProviderOption;
+  if (webgpuOptions?.preferredLayout) {
+    if (webgpuOptions.preferredLayout !== 'NCHW' && webgpuOptions.preferredLayout !== 'NHWC') {
+      throw new Error(`preferredLayout must be either 'NCHW' or 'NHWC': ${webgpuOptions.preferredLayout}`);
+    }
+    appendSessionConfig(sessionOptionsHandle, 'preferredLayout', webgpuOptions.preferredLayout, allocs);
+  }
+};
+
+const allocEpOptions = (epOptions: Array<[number, number]>, allocs: number[]): [number, number] => {
+  const epOptionsCount = epOptions.length;
+  if (epOptionsCount === 0) {
+    return [0, 0];
+  }
+  const keysOffset = getInstance()._malloc(epOptionsCount * getInstance().PTR_SIZE);
+  allocs.push(keysOffset);
+  const valuesOffset = getInstance()._malloc(epOptionsCount * getInstance().PTR_SIZE);
+  allocs.push(valuesOffset);
+  for (let i = 0; i < epOptionsCount; i++) {
+    getInstance().setValue(keysOffset + i * getInstance().PTR_SIZE, epOptions[i][0], '*');
+    getInstance().setValue(valuesOffset + i * getInstance().PTR_SIZE, epOptions[i][1], '*');
+  }
+  return [keysOffset, valuesOffset];
+};
+
 const setExecutionProviders = async (
   sessionOptionsHandle: number,
   sessionOptions: InferenceSession.SessionOptions,
@@ -84,106 +229,15 @@ const setExecutionProviders = async (
     switch (epName) {
       case 'webnn':
         epName = 'WEBNN';
-        // Disable QDQ fusion so DQ/Q nodes are preserved as individual ops for WebNN EP.
-        appendSessionConfig(sessionOptionsHandle, 'session.disable_quant_qdq', '1', allocs);
-        // Forcibly prevent constant folding from replacing DQ nodes with constants.
-        appendSessionConfig(sessionOptionsHandle, 'session.disable_qdq_constant_folding', '1', allocs);
-        if (typeof ep !== 'string') {
-          const webnnOptions = ep as InferenceSession.WebNNExecutionProviderOption;
-          // const context = (webnnOptions as InferenceSession.WebNNOptionsWithMLContext)?.context;
-          const deviceType = (webnnOptions as InferenceSession.WebNNContextOptions)?.deviceType;
-          if (deviceType) {
-            appendSessionConfig(sessionOptionsHandle, 'deviceType', deviceType, allocs);
-          }
-        }
+        setWebNNOptions(sessionOptionsHandle, ep, allocs);
         break;
       case 'webgpu':
         if (!BUILD_DEFS.DISABLE_WEBGPU) {
           epName = 'WebGPU';
-          let customDevice: GPUDevice | undefined;
-
-          if (typeof ep !== 'string') {
-            const webgpuOptions = ep as InferenceSession.WebGpuExecutionProviderOption;
-
-            // set custom GPU device
-            if (webgpuOptions.device) {
-              if (typeof GPUDevice !== 'undefined' && webgpuOptions.device instanceof GPUDevice) {
-                customDevice = webgpuOptions.device;
-              } else {
-                throw new Error('Invalid GPU device set in WebGPU EP options.');
-              }
-            }
-
-            // set graph capture option from session options
-            const { enableGraphCapture } = sessionOptions;
-            if (typeof enableGraphCapture === 'boolean' && enableGraphCapture) {
-              appendEpOption(epOptions, 'enableGraphCapture', '1', allocs);
-            }
-
-            // set layout option
-            if (typeof webgpuOptions.preferredLayout === 'string') {
-              appendEpOption(epOptions, 'preferredLayout', webgpuOptions.preferredLayout, allocs);
-            }
-
-            // set force CPU fallback nodes
-            if (webgpuOptions.forceCpuNodeNames) {
-              const names = Array.isArray(webgpuOptions.forceCpuNodeNames)
-                ? webgpuOptions.forceCpuNodeNames
-                : [webgpuOptions.forceCpuNodeNames];
-
-              appendEpOption(epOptions, 'forceCpuNodeNames', names.join('\n'), allocs);
-            }
-
-            // set validation mode
-            if (webgpuOptions.validationMode) {
-              appendEpOption(epOptions, 'validationMode', webgpuOptions.validationMode, allocs);
-            }
-
-            // set f32 accumulation for the MatMulNBits kernels
-            if (typeof webgpuOptions.enableMatmulFp32Accumulation === 'boolean') {
-              appendEpOption(
-                epOptions,
-                'enableMatmulFp32Accumulation',
-                webgpuOptions.enableMatmulFp32Accumulation ? '1' : '0',
-                allocs,
-              );
-            }
-
-            // set buffer cache modes
-            for (const key of [
-              'storageBufferCacheMode',
-              'uniformBufferCacheMode',
-              'queryResolveBufferCacheMode',
-              'defaultBufferCacheMode',
-            ] as const) {
-              const mode = webgpuOptions[key];
-              if (mode) {
-                if (mode !== 'disabled' && mode !== 'lazyRelease' && mode !== 'simple' && mode !== 'bucket') {
-                  throw new Error(`${key} must be one of 'disabled', 'lazyRelease', 'simple' or 'bucket': ${mode}`);
-                }
-                appendEpOption(epOptions, key, mode, allocs);
-              }
-            }
-          }
-
-          const info = getInstance().webgpuRegisterDevice!(customDevice);
-          if (info) {
-            const [deviceId, instanceHandle, deviceHandle] = info;
-            appendEpOption(epOptions, 'deviceId', deviceId.toString(), allocs);
-            appendEpOption(epOptions, 'webgpuInstance', instanceHandle.toString(), allocs);
-            appendEpOption(epOptions, 'webgpuDevice', deviceHandle.toString(), allocs);
-          }
+          setWebGpuOptions(ep, sessionOptions, epOptions, allocs);
         } else {
           epName = 'JS';
-          if (typeof ep !== 'string') {
-            const webgpuOptions = ep as InferenceSession.WebGpuExecutionProviderOption;
-            if (webgpuOptions?.preferredLayout) {
-              if (webgpuOptions.preferredLayout !== 'NCHW' && webgpuOptions.preferredLayout !== 'NHWC') {
-                throw new Error(`preferredLayout must be either 'NCHW' or 'NHWC': ${webgpuOptions.preferredLayout}`);
-              }
-              appendSessionConfig(sessionOptionsHandle, 'preferredLayout', webgpuOptions.preferredLayout, allocs);
-            }
-          }
+          setJsepOptions(sessionOptionsHandle, ep, allocs);
         }
         break;
       case 'wasm':
@@ -195,18 +249,7 @@ const setExecutionProviders = async (
 
     const epNameDataOffset = allocWasmString(epName, allocs);
     const epOptionsCount = epOptions.length;
-    let keysOffset = 0;
-    let valuesOffset = 0;
-    if (epOptionsCount > 0) {
-      keysOffset = getInstance()._malloc(epOptionsCount * getInstance().PTR_SIZE);
-      allocs.push(keysOffset);
-      valuesOffset = getInstance()._malloc(epOptionsCount * getInstance().PTR_SIZE);
-      allocs.push(valuesOffset);
-      for (let i = 0; i < epOptionsCount; i++) {
-        getInstance().setValue(keysOffset + i * getInstance().PTR_SIZE, epOptions[i][0], '*');
-        getInstance().setValue(valuesOffset + i * getInstance().PTR_SIZE, epOptions[i][1], '*');
-      }
-    }
+    const [keysOffset, valuesOffset] = allocEpOptions(epOptions, allocs);
     if (
       (await getInstance()._OrtAppendExecutionProvider(
         sessionOptionsHandle,

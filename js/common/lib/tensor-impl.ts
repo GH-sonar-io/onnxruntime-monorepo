@@ -41,6 +41,208 @@ type TensorDataLocation = TensorInterface.DataLocation;
 type TensorTextureType = TensorInterface.TextureType;
 type TensorGpuBufferType = TensorInterface.GpuBufferType;
 type TensorMLTensorType = TensorInterface.MLTensorType;
+type CpuTensorDataArg = TensorDataType | Uint8ClampedArray | readonly number[] | readonly string[] | readonly boolean[];
+type CpuTensorDataSource = TensorDataType | Uint8ClampedArray | readonly string[] | readonly boolean[];
+type LocationConstructorParameters =
+  | CpuPinnedConstructorParameters
+  | TextureConstructorParameters
+  | GpuBufferConstructorParameters
+  | MLTensorConstructorParameters;
+
+const GPU_BUFFER_SUPPORTED_TYPES = new Set<TensorType>([
+  'float32',
+  'float16',
+  'int32',
+  'int64',
+  'uint32',
+  'uint8',
+  'bool',
+  'uint4',
+  'int4',
+]);
+
+const ML_TENSOR_SUPPORTED_TYPES = new Set<TensorType>([
+  'float32',
+  'float16',
+  'int32',
+  'int64',
+  'uint32',
+  'uint64',
+  'int8',
+  'uint8',
+  'bool',
+  'uint4',
+  'int4',
+]);
+
+const validatePinnedBuffer = (type: TensorType, data: TensorDataType): void => {
+  const expectedTypedArrayConstructor = NUMERIC_TENSOR_TYPE_TO_TYPEDARRAY_MAP.get(type);
+  if (!expectedTypedArrayConstructor) {
+    throw new TypeError(`unsupported type "${type}" to create tensor from pinned buffer`);
+  }
+  if (!(data instanceof expectedTypedArrayConstructor)) {
+    throw new TypeError(`buffer should be of type ${expectedTypedArrayConstructor.name}`);
+  }
+};
+
+const createNumericTensorDataFromArray = (
+  type: TensorType,
+  typedArrayConstructor: SupportedTypedArrayConstructors,
+  arg1: CpuTensorDataArg,
+): TensorDataType => {
+  if ((type === 'float16' && typedArrayConstructor === Uint16Array) || type === 'uint4' || type === 'int4') {
+    // - 'float16':
+    //   When no Float16Array polyfill is used, we cannot create 'float16' tensor from number array.
+    //
+    //   Throw error here because when user try to use number array as data,
+    //   e.g. new Tensor('float16', [1, 2, 3, 4], dims)), it will actually call
+    //   Uint16Array.from(arg1) which generates wrong data.
+    //
+    // - 'uint4' and 'int4':
+    //   Uint8Array.from(arg1) will generate wrong data for 'uint4' and 'int4' tensor.
+    //
+    throw new TypeError(
+      `Creating a ${type} tensor from number array is not supported. Please use ${typedArrayConstructor.name} as data.`,
+    );
+  }
+  if (type === 'uint64' || type === 'int64') {
+    // use 'as any' here because:
+    // 1. TypeScript's check on type of 'Array.isArray()' does not work with readonly arrays.
+    // see https://github.com/microsoft/TypeScript/issues/17002
+    // 2. TypeScript's check on union type of '(BigInt64ArrayConstructor|BigUint64ArrayConstructor).from()'
+    // does not accept parameter mapFn.
+    // 3. parameters of 'SupportedTypedArrayConstructors.from()' does not match the requirement of the union
+    // type.
+
+    // assume 'arg1' is of type "readonly number[]|readonly bigint[]" here.
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    return (typedArrayConstructor as any).from(arg1, BigInt);
+  }
+  // assume 'arg1' is of type "readonly number[]" here.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  return (typedArrayConstructor as any).from(arg1);
+};
+
+const createNumericTensorData = (type: TensorType, arg1: CpuTensorDataArg | undefined): TensorDataType => {
+  const typedArrayConstructor = NUMERIC_TENSOR_TYPE_TO_TYPEDARRAY_MAP.get(type);
+  if (typedArrayConstructor === undefined) {
+    throw new TypeError(`Unsupported tensor type: ${type}.`);
+  }
+  if (Array.isArray(arg1)) {
+    return createNumericTensorDataFromArray(type, typedArrayConstructor, arg1);
+  }
+  if (arg1 instanceof typedArrayConstructor) {
+    return arg1;
+  }
+  if (arg1 instanceof Uint8ClampedArray) {
+    if (type === 'uint8') {
+      return Uint8Array.from(arg1);
+    }
+    throw new TypeError(`A Uint8ClampedArray tensor's data must be type of uint8`);
+  }
+  if (type === 'float16' && arg1 instanceof Uint16Array && typedArrayConstructor !== Uint16Array) {
+    // when Float16Array is available and data is of type Uint16Array.
+    // We allow Uint16Array to be passed in as data for 'float16' tensor until Float16Array is generally
+    // supported in JavaScript environment.
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    return new (globalThis as any).Float16Array(arg1.buffer, arg1.byteOffset, arg1.length);
+  }
+  throw new TypeError(`A ${type} tensor's data must be type of ${typedArrayConstructor}`);
+};
+
+/**
+ * create tensor data from the given type and data. Used by override: constructor(type, data, ...)
+ */
+const createTensorDataFromType = (type: TensorType, arg1: CpuTensorDataArg | undefined): TensorDataType => {
+  if (type === 'string') {
+    if (!Array.isArray(arg1)) {
+      throw new TypeError("A string tensor's data must be a string array.");
+    }
+    // we don't check whether every element in the array is string; this is too slow. we assume it's correct and
+    // error will be populated at inference
+    return arg1;
+  }
+  return createNumericTensorData(type, arg1);
+};
+
+/**
+ * infer tensor type and data from the given data. Used by override: constructor(data, ...)
+ */
+const inferTypeAndData = (arg0: CpuTensorDataSource): { type: TensorType; data: TensorDataType } => {
+  if (Array.isArray(arg0)) {
+    // only boolean[] and string[] is supported
+    if (arg0.length === 0) {
+      throw new TypeError('Tensor type cannot be inferred from an empty array.');
+    }
+    const firstElementType = typeof arg0[0];
+    if (firstElementType === 'string') {
+      return { type: 'string', data: arg0 };
+    }
+    if (firstElementType === 'boolean') {
+      // 'arg0' is of type 'boolean[]'. Uint8Array.from(boolean[]) actually works, but typescript thinks this is
+      // wrong type. We use 'as any' to make it happy.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      return { type: 'bool', data: Uint8Array.from(arg0 as any[]) };
+    }
+    throw new TypeError(`Invalid element type of data array: ${firstElementType}.`);
+  }
+  if (arg0 instanceof Uint8ClampedArray) {
+    return { type: 'uint8', data: Uint8Array.from(arg0) };
+  }
+  // get tensor type from TypedArray
+  const mappedType = NUMERIC_TENSOR_TYPEDARRAY_TO_TYPE_MAP.get(arg0.constructor as SupportedTypedArrayConstructors);
+  if (mappedType === undefined) {
+    throw new TypeError(`Unsupported type for tensor data: ${arg0.constructor}.`);
+  }
+  return { type: mappedType, data: arg0 as SupportedTypedArray };
+};
+
+/**
+ * parse the arguments for constructing a tensor of location 'cpu'.
+ */
+const parseCpuTensorArgs = (
+  arg0: TensorType | CpuTensorDataSource,
+  arg1?: CpuTensorDataArg,
+  arg2?: readonly number[],
+): { type: TensorType; data: TensorDataType; dims: readonly number[] } => {
+  let type: TensorType;
+  let data: TensorDataType;
+  let maybeDims: typeof arg1 | typeof arg2;
+  if (typeof arg0 === 'string') {
+    // Override: constructor(type, data, ...)
+    type = arg0;
+    maybeDims = arg2;
+    data = createTensorDataFromType(arg0, arg1);
+  } else {
+    // Override: constructor(data, ...)
+    maybeDims = arg1;
+    ({ type, data } = inferTypeAndData(arg0));
+  }
+
+  if (maybeDims === undefined) {
+    // assume 1-D tensor if dims omitted
+    maybeDims = [data.length];
+  } else if (!Array.isArray(maybeDims)) {
+    throw new TypeError("A tensor's dims must be a number array");
+  }
+  return { type, data, dims: maybeDims as readonly number[] };
+};
+
+/**
+ * check whether the CPU data length matches the tensor size.
+ */
+const validateDataLength = (type: TensorType, size: number, cpuData: TensorDataType | undefined): void => {
+  if (!cpuData || size === cpuData.length) {
+    return;
+  }
+  // for (u)int4, the data length is half of the tensor size. So we check this special case when size is odd.
+  if ((type === 'uint4' || type === 'int4') && Math.ceil(size / 2) === cpuData.length) {
+    return;
+  }
+  throw new Error(`Tensor's size(${size}) does not match data length(${cpuData.length}).`);
+};
 
 /**
  * the implementation of Tensor interface.
@@ -129,215 +331,69 @@ export class Tensor implements TensorInterface {
       this.dataLocation = arg0.location;
       type = arg0.type;
       dims = arg0.dims;
-      switch (arg0.location) {
-        case 'cpu-pinned': {
-          const expectedTypedArrayConstructor = NUMERIC_TENSOR_TYPE_TO_TYPEDARRAY_MAP.get(type);
-          if (!expectedTypedArrayConstructor) {
-            throw new TypeError(`unsupported type "${type}" to create tensor from pinned buffer`);
-          }
-          if (!(arg0.data instanceof expectedTypedArrayConstructor)) {
-            throw new TypeError(`buffer should be of type ${expectedTypedArrayConstructor.name}`);
-          }
-          this.cpuData = arg0.data;
-          break;
-        }
-        case 'texture': {
-          if (type !== 'float32') {
-            throw new TypeError(`unsupported type "${type}" to create tensor from texture`);
-          }
-          this.gpuTextureData = arg0.texture;
-          this.downloader = arg0.download;
-          this.disposer = arg0.dispose;
-          break;
-        }
-        case 'gpu-buffer': {
-          if (
-            type !== 'float32' &&
-            type !== 'float16' &&
-            type !== 'int32' &&
-            type !== 'int64' &&
-            type !== 'uint32' &&
-            type !== 'uint8' &&
-            type !== 'bool' &&
-            type !== 'uint4' &&
-            type !== 'int4'
-          ) {
-            throw new TypeError(`unsupported type "${type}" to create tensor from gpu buffer`);
-          }
-          this.gpuBufferData = arg0.gpuBuffer;
-          this.downloader = arg0.download;
-          this.disposer = arg0.dispose;
-          break;
-        }
-        case 'ml-tensor': {
-          if (
-            type !== 'float32' &&
-            type !== 'float16' &&
-            type !== 'int32' &&
-            type !== 'int64' &&
-            type !== 'uint32' &&
-            type !== 'uint64' &&
-            type !== 'int8' &&
-            type !== 'uint8' &&
-            type !== 'bool' &&
-            type !== 'uint4' &&
-            type !== 'int4'
-          ) {
-            throw new TypeError(`unsupported type "${type}" to create tensor from MLTensor`);
-          }
-          this.mlTensorData = arg0.mlTensor;
-          this.downloader = arg0.download;
-          this.disposer = arg0.dispose;
-          break;
-        }
-        default:
-          throw new Error(`Tensor constructor: unsupported location '${this.dataLocation}'`);
-      }
+      this.initFromLocation(arg0);
     } else {
       //
       // constructing tensor of location 'cpu'
       //
-      let data: TensorDataType;
-      let maybeDims: typeof arg1 | typeof arg2;
-      // check whether arg0 is type or data
-      if (typeof arg0 === 'string') {
-        //
-        // Override: constructor(type, data, ...)
-        //
-        type = arg0;
-        maybeDims = arg2;
-        if (arg0 === 'string') {
-          // string tensor
-          if (!Array.isArray(arg1)) {
-            throw new TypeError("A string tensor's data must be a string array.");
-          }
-          // we don't check whether every element in the array is string; this is too slow. we assume it's correct and
-          // error will be populated at inference
-          data = arg1;
-        } else {
-          // numeric tensor
-          const typedArrayConstructor = NUMERIC_TENSOR_TYPE_TO_TYPEDARRAY_MAP.get(arg0);
-          if (typedArrayConstructor === undefined) {
-            throw new TypeError(`Unsupported tensor type: ${arg0}.`);
-          }
-          if (Array.isArray(arg1)) {
-            if ((arg0 === 'float16' && typedArrayConstructor === Uint16Array) || arg0 === 'uint4' || arg0 === 'int4') {
-              // - 'float16':
-              //   When no Float16Array polyfill is used, we cannot create 'float16' tensor from number array.
-              //
-              //   Throw error here because when user try to use number array as data,
-              //   e.g. new Tensor('float16', [1, 2, 3, 4], dims)), it will actually call
-              //   Uint16Array.from(arg1) which generates wrong data.
-              //
-              // - 'uint4' and 'int4':
-              //   Uint8Array.from(arg1) will generate wrong data for 'uint4' and 'int4' tensor.
-              //
-              throw new TypeError(
-                `Creating a ${arg0} tensor from number array is not supported. Please use ${typedArrayConstructor.name} as data.`,
-              );
-            } else if (arg0 === 'uint64' || arg0 === 'int64') {
-              // use 'as any' here because:
-              // 1. TypeScript's check on type of 'Array.isArray()' does not work with readonly arrays.
-              // see https://github.com/microsoft/TypeScript/issues/17002
-              // 2. TypeScript's check on union type of '(BigInt64ArrayConstructor|BigUint64ArrayConstructor).from()'
-              // does not accept parameter mapFn.
-              // 3. parameters of 'SupportedTypedArrayConstructors.from()' does not match the requirement of the union
-              // type.
-
-              // assume 'arg1' is of type "readonly number[]|readonly bigint[]" here.
-
-              // eslint-disable-next-line @typescript-eslint/no-explicit-any
-              data = (typedArrayConstructor as any).from(arg1, BigInt);
-            } else {
-              // assume 'arg1' is of type "readonly number[]" here.
-              // eslint-disable-next-line @typescript-eslint/no-explicit-any
-              data = (typedArrayConstructor as any).from(arg1);
-            }
-          } else if (arg1 instanceof typedArrayConstructor) {
-            data = arg1;
-          } else if (arg1 instanceof Uint8ClampedArray) {
-            if (arg0 === 'uint8') {
-              data = Uint8Array.from(arg1);
-            } else {
-              throw new TypeError(`A Uint8ClampedArray tensor's data must be type of uint8`);
-            }
-          } else if (arg0 === 'float16' && arg1 instanceof Uint16Array && typedArrayConstructor !== Uint16Array) {
-            // when Float16Array is available and data is of type Uint16Array.
-            // We allow Uint16Array to be passed in as data for 'float16' tensor until Float16Array is generally
-            // supported in JavaScript environment.
-
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            data = new (globalThis as any).Float16Array(arg1.buffer, arg1.byteOffset, arg1.length);
-          } else {
-            throw new TypeError(`A ${type} tensor's data must be type of ${typedArrayConstructor}`);
-          }
-        }
-      } else {
-        //
-        // Override: constructor(data, ...)
-        //
-        maybeDims = arg1;
-        if (Array.isArray(arg0)) {
-          // only boolean[] and string[] is supported
-          if (arg0.length === 0) {
-            throw new TypeError('Tensor type cannot be inferred from an empty array.');
-          }
-          const firstElementType = typeof arg0[0];
-          if (firstElementType === 'string') {
-            type = 'string';
-            data = arg0;
-          } else if (firstElementType === 'boolean') {
-            type = 'bool';
-            // 'arg0' is of type 'boolean[]'. Uint8Array.from(boolean[]) actually works, but typescript thinks this is
-            // wrong type. We use 'as any' to make it happy.
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            data = Uint8Array.from(arg0 as any[]);
-          } else {
-            throw new TypeError(`Invalid element type of data array: ${firstElementType}.`);
-          }
-        } else if (arg0 instanceof Uint8ClampedArray) {
-          type = 'uint8';
-          data = Uint8Array.from(arg0);
-        } else {
-          // get tensor type from TypedArray
-          const mappedType = NUMERIC_TENSOR_TYPEDARRAY_TO_TYPE_MAP.get(
-            arg0.constructor as SupportedTypedArrayConstructors,
-          );
-          if (mappedType === undefined) {
-            throw new TypeError(`Unsupported type for tensor data: ${arg0.constructor}.`);
-          }
-          type = mappedType;
-          data = arg0 as SupportedTypedArray;
-        }
-      }
-
-      // type and data is processed, now processing dims
-      if (maybeDims === undefined) {
-        // assume 1-D tensor if dims omitted
-        maybeDims = [data.length];
-      } else if (!Array.isArray(maybeDims)) {
-        throw new TypeError("A tensor's dims must be a number array");
-      }
-      dims = maybeDims as readonly number[];
-
-      this.cpuData = data;
+      const parsed = parseCpuTensorArgs(arg0 as TensorType | CpuTensorDataSource, arg1, arg2);
+      type = parsed.type;
+      dims = parsed.dims;
+      this.cpuData = parsed.data;
       this.dataLocation = 'cpu';
     }
 
     // perform check on dims
     const size = calculateSize(dims);
     // if data is on CPU, check whether data length matches tensor size
-    if (this.cpuData && size !== this.cpuData.length) {
-      if ((type === 'uint4' || type === 'int4') && Math.ceil(size / 2) === this.cpuData.length) {
-        // for (u)int4, the data length is half of the tensor size. So we check this special case when size is odd.
-      } else {
-        throw new Error(`Tensor's size(${size}) does not match data length(${this.cpuData.length}).`);
-      }
-    }
+    validateDataLength(type, size, this.cpuData);
 
     this.type = type;
     this.dims = dims;
     this.size = size;
+  }
+
+  /**
+   * initialize the tensor data fields from the given location-specific constructor parameters.
+   */
+  private initFromLocation(params: LocationConstructorParameters): void {
+    const type = params.type;
+    switch (params.location) {
+      case 'cpu-pinned': {
+        validatePinnedBuffer(type, params.data);
+        this.cpuData = params.data;
+        break;
+      }
+      case 'texture': {
+        if (type !== 'float32') {
+          throw new TypeError(`unsupported type "${type}" to create tensor from texture`);
+        }
+        this.gpuTextureData = params.texture;
+        this.downloader = params.download;
+        this.disposer = params.dispose;
+        break;
+      }
+      case 'gpu-buffer': {
+        if (!GPU_BUFFER_SUPPORTED_TYPES.has(type)) {
+          throw new TypeError(`unsupported type "${type}" to create tensor from gpu buffer`);
+        }
+        this.gpuBufferData = params.gpuBuffer;
+        this.downloader = params.download;
+        this.disposer = params.dispose;
+        break;
+      }
+      case 'ml-tensor': {
+        if (!ML_TENSOR_SUPPORTED_TYPES.has(type)) {
+          throw new TypeError(`unsupported type "${type}" to create tensor from MLTensor`);
+        }
+        this.mlTensorData = params.mlTensor;
+        this.downloader = params.download;
+        this.disposer = params.dispose;
+        break;
+      }
+      default:
+        throw new Error(`Tensor constructor: unsupported location '${this.dataLocation}'`);
+    }
   }
   // #endregion
 

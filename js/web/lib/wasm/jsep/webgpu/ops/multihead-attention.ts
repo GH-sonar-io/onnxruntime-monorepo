@@ -20,6 +20,176 @@ import { createTransposeProgramInfo, TransposeAttributes } from './transpose';
 const getInput = (inputs: readonly TensorView[], i: number) =>
   inputs.length > i && inputs[i].dims.length > 0 ? inputs[i] : undefined;
 
+const validatePastKeyValue = (
+  pastKey: TensorView | undefined,
+  pastValue: TensorView | undefined,
+  batchSize: number,
+  numHeads: number,
+  headSize: number,
+): number => {
+  if (pastKey && pastValue && ShapeUtil.size(pastKey.dims) && ShapeUtil.size(pastValue.dims)) {
+    if (pastKey.dims.length !== 4) {
+      throw new Error('Input "past_key" is expected to have 4 dimensions');
+    }
+    if (pastKey.dims[0] !== batchSize || pastKey.dims[1] !== numHeads || pastKey.dims[3] !== headSize) {
+      throw new Error('Input "past_key" shape (batch_size, num_heads, past_sequence_length, head_size)');
+    }
+    if (pastValue.dims[0] !== batchSize || pastValue.dims[1] !== numHeads || pastValue.dims[3] !== headSize) {
+      throw new Error('Input "past_value" shape (batch_size, num_heads, past_sequence_length, head_size)');
+    }
+    if (pastKey.dims[2] !== pastValue.dims[2]) {
+      throw new Error('Input "past_key" and "past_value" shall have same dim 2 (past_sequence_length)');
+    }
+    if (pastValue.dims.length !== 4) {
+      throw new Error('Input "past_value" is expected to have 4 dimensions');
+    }
+    return pastKey.dims[2];
+  }
+  if ((pastKey && ShapeUtil.size(pastKey.dims)) || (pastValue && ShapeUtil.size(pastValue.dims))) {
+    throw new Error('Input "past_key" and "past_value" shall be both present or both absent');
+  }
+  return 0;
+};
+
+const validateKey = (
+  query: TensorView,
+  key: TensorView,
+  value: TensorView | undefined,
+  numHeads: number,
+  headSize: number,
+): { qkvFormat: AttentionQkvFormat; kvSequenceLength: number } => {
+  if (query.dims.length !== 3) {
+    throw new Error('Input "query" is expected to have 3 dimensions when key is given');
+  }
+  if (key.dims.length < 3 || key.dims.length > 5) {
+    throw new Error('Input "key" is expected to have 3, 4, or 5 dimensions');
+  }
+  if (query.dims[0] !== key.dims[0]) {
+    throw new Error('Input "query" and "key" shall have same dim 0 (batch size)');
+  }
+
+  if (key.dims.length === 3) {
+    if (key.dims[2] !== query.dims[2]) {
+      throw new Error('Input "query" and "key" shall have same dim 2 (hidden_size)');
+    }
+    return { qkvFormat: AttentionQkvFormat.qkvBSNH, kvSequenceLength: key.dims[1] };
+  }
+  if (key.dims.length === 5) {
+    if (key.dims[2] !== numHeads || key.dims[3] !== 2 || key.dims[4] !== headSize) {
+      throw new Error('Expect "key" shape (batch_size, kv_sequence_length, num_heads, 2, head_size) for packed kv');
+    }
+    if (value) {
+      throw new Error('Expect "value" be none when "key" has packed kv format.');
+    }
+    return { qkvFormat: AttentionQkvFormat.qKvBSNHxBSN2H, kvSequenceLength: key.dims[1] };
+  }
+  // key_dims.size() == 4 (cross-attention with past_key)
+  if (key.dims[1] !== numHeads || key.dims[3] !== headSize) {
+    throw new Error('Expect "key" shape (batch_size, num_heads, kv_sequence_length, head_size) for past_key');
+  }
+  // Q_K_V_BSNH_BNSH_BNSH
+  return { qkvFormat: AttentionQkvFormat.unknown, kvSequenceLength: key.dims[2] };
+};
+
+const validatePackedQkv = (query: TensorView, numHeads: number): void => {
+  if (query.dims.length !== 5) {
+    throw new Error('Input "query" is expected to have 5 dimensions when key is empty');
+  }
+  if (query.dims[2] !== numHeads || query.dims[3] !== 3) {
+    throw new Error('Expect "query" shape (batch_size, kv_sequence_length, num_heads, 3, head_size) for packed kv');
+  }
+};
+
+const validateBias = (bias: TensorView | undefined, key: TensorView | undefined): void => {
+  if (!bias || ShapeUtil.size(bias.dims) <= 0) {
+    return;
+  }
+  if (bias.dims.length !== 1) {
+    throw new Error('Input "bias" is expected to have 1 dimension');
+  }
+  if (key?.dims.length === 5 && key.dims[3] === 2) {
+    throw new Error('bias is not allowed for packed kv.');
+  }
+};
+
+const validateKeyPaddingMask = (
+  keyPaddingMask: TensorView | undefined,
+  batchSize: number,
+  totalSequenceLength: number,
+): AttentionMaskType => {
+  if (!keyPaddingMask || ShapeUtil.size(keyPaddingMask.dims) <= 0) {
+    return AttentionMaskType.none;
+  }
+  let maskType: AttentionMaskType = AttentionMaskType.maskUnknown;
+  const maskDims = keyPaddingMask.dims;
+  if (maskDims.length === 1) {
+    if (maskDims[0] === batchSize) {
+      maskType = AttentionMaskType.mask1dKeySeqLen;
+    } else if (maskDims[0] === 3 * batchSize + 2) {
+      maskType = AttentionMaskType.mask1DKeySeqLenStart;
+    }
+  } else if (maskDims.length === 2 && maskDims[0] === batchSize && maskDims[1] === totalSequenceLength) {
+    maskType = AttentionMaskType.mask2dKeyPadding;
+  }
+  if (maskType === AttentionMaskType.maskUnknown) {
+    throw new Error('Input "key_padding_mask" shape shall be (batch_size) or (batch_size, total_sequence_length)');
+  }
+  throw new Error('Mask not supported');
+};
+
+const validateValue = (
+  query: TensorView,
+  value: TensorView | undefined,
+  kvSequenceLength: number,
+  hiddenSize: number,
+): { vHiddenSize: number; passPastInKv: boolean } => {
+  if (!value || ShapeUtil.size(value.dims) <= 0) {
+    return { vHiddenSize: hiddenSize, passPastInKv: false };
+  }
+  if (value.dims.length !== 3 && value.dims.length !== 4) {
+    throw new Error('Input "value" is expected to have 3 or 4 dimensions');
+  }
+  if (query.dims[0] !== value.dims[0]) {
+    throw new Error('Input "query" and "value" shall have same dim 0 (batch_size)');
+  }
+  if (value.dims.length === 3) {
+    if (kvSequenceLength !== value.dims[1]) {
+      throw new Error('Input "key" and "value" shall have the same dim 1 (kv_sequence_length)');
+    }
+    return { vHiddenSize: value.dims[2], passPastInKv: false };
+  }
+  // Q_K_V_BSNH_BNSH_BNSH
+  if (kvSequenceLength !== value.dims[2]) {
+    throw new Error('Input "key" and "value" shall have the same dim 2 (kv_sequence_length)');
+  }
+  return { vHiddenSize: value.dims[1] * value.dims[3], passPastInKv: true };
+};
+
+const validateAttentionBias = (
+  attentionBias: TensorView | undefined,
+  batchSize: number,
+  numHeads: number,
+  sequenceLength: number,
+  totalSequenceLength: number,
+): void => {
+  if (!attentionBias || ShapeUtil.size(attentionBias.dims) <= 0) {
+    return;
+  }
+  if (attentionBias.dims.length !== 4) {
+    throw new Error('Input "attention_bias" is expected to have 4 dimensions');
+  }
+
+  // TODO: support broadcasting the first and second dimensions of attention_bias.
+  if (
+    attentionBias.dims[0] !== batchSize ||
+    attentionBias.dims[1] !== numHeads ||
+    attentionBias.dims[2] !== sequenceLength ||
+    attentionBias.dims[3] !== totalSequenceLength
+  ) {
+    throw new Error('Expect "attention_bias" shape (batch_size, num_heads, sequence_length, total_sequence_length)');
+  }
+};
+
 const validateInputs = (inputs: readonly TensorView[], attributes: AttentionAttrs): AttentionParameters => {
   const query = inputs[0];
   const key = getInput(inputs, 1);
@@ -82,141 +252,25 @@ const validateInputs = (inputs: readonly TensorView[], attributes: AttentionAttr
   const hiddenSize = query.dims.length === 3 ? query.dims[2] : attributes.numHeads * query.dims[4];
   let kvSequenceLength = sequenceLength;
 
-  let pastSequenceLength = 0;
-  let maxSequenceLength = 0;
   const headSize = Math.floor(hiddenSize / attributes.numHeads);
-  if (pastKey && pastValue && ShapeUtil.size(pastKey.dims) && ShapeUtil.size(pastValue.dims)) {
-    if (pastKey.dims.length !== 4) {
-      throw new Error('Input "past_key" is expected to have 4 dimensions');
-    }
-    if (pastKey.dims[0] !== batchSize || pastKey.dims[1] !== attributes.numHeads || pastKey.dims[3] !== headSize) {
-      throw new Error('Input "past_key" shape (batch_size, num_heads, past_sequence_length, head_size)');
-    }
-    if (
-      pastValue.dims[0] !== batchSize ||
-      pastValue.dims[1] !== attributes.numHeads ||
-      pastValue.dims[3] !== headSize
-    ) {
-      throw new Error('Input "past_value" shape (batch_size, num_heads, past_sequence_length, head_size)');
-    }
-    if (pastKey.dims[2] !== pastValue.dims[2]) {
-      throw new Error('Input "past_key" and "past_value" shall have same dim 2 (past_sequence_length)');
-    }
-    if (pastValue.dims.length !== 4) {
-      throw new Error('Input "past_value" is expected to have 4 dimensions');
-    }
-    pastSequenceLength = pastKey.dims[2];
-    maxSequenceLength = pastKey.dims[2];
-  } else if ((pastKey && ShapeUtil.size(pastKey.dims)) || (pastValue && ShapeUtil.size(pastValue.dims))) {
-    throw new Error('Input "past_key" and "past_value" shall be both present or both absent');
-  }
+  const pastSequenceLength = validatePastKeyValue(pastKey, pastValue, batchSize, attributes.numHeads, headSize);
+  const maxSequenceLength = pastSequenceLength;
 
   let qkvFormat: AttentionQkvFormat;
   if (key && ShapeUtil.size(key.dims) > 0) {
-    if (query.dims.length !== 3) {
-      throw new Error('Input "query" is expected to have 3 dimensions when key is given');
-    }
-    if (key.dims.length < 3 || key.dims.length > 5) {
-      throw new Error('Input "key" is expected to have 3, 4, or 5 dimensions');
-    }
-    if (query.dims[0] !== key.dims[0]) {
-      throw new Error('Input "query" and "key" shall have same dim 0 (batch size)');
-    }
-
-    if (key.dims.length === 3) {
-      if (key.dims[2] !== query.dims[2]) {
-        throw new Error('Input "query" and "key" shall have same dim 2 (hidden_size)');
-      }
-      qkvFormat = AttentionQkvFormat.qkvBSNH;
-      kvSequenceLength = key.dims[1];
-    } else if (key.dims.length === 5) {
-      if (key.dims[2] !== attributes.numHeads || key.dims[3] !== 2 || key.dims[4] !== headSize) {
-        throw new Error('Expect "key" shape (batch_size, kv_sequence_length, num_heads, 2, head_size) for packed kv');
-      }
-      if (value) {
-        throw new Error('Expect "value" be none when "key" has packed kv format.');
-      }
-      qkvFormat = AttentionQkvFormat.qKvBSNHxBSN2H;
-      kvSequenceLength = key.dims[1];
-    } else {
-      // key_dims.size() == 4 (cross-attention with past_key)
-      if (key.dims[1] !== attributes.numHeads || key.dims[3] !== headSize) {
-        throw new Error('Expect "key" shape (batch_size, num_heads, kv_sequence_length, head_size) for past_key');
-      }
-
-      qkvFormat = AttentionQkvFormat.unknown; // Q_K_V_BSNH_BNSH_BNSH
-      kvSequenceLength = key.dims[2];
-    }
+    ({ qkvFormat, kvSequenceLength } = validateKey(query, key, value, attributes.numHeads, headSize));
   } else {
-    // packed QKV
-    if (query.dims.length !== 5) {
-      throw new Error('Input "query" is expected to have 5 dimensions when key is empty');
-    }
-    if (query.dims[2] !== attributes.numHeads || query.dims[3] !== 3) {
-      throw new Error('Expect "query" shape (batch_size, kv_sequence_length, num_heads, 3, head_size) for packed kv');
-    }
-
+    validatePackedQkv(query, attributes.numHeads);
     qkvFormat = AttentionQkvFormat.qkvBSN3H;
   }
 
-  if (bias && ShapeUtil.size(bias.dims) > 0) {
-    if (bias.dims.length !== 1) {
-      throw new Error('Input "bias" is expected to have 1 dimension');
-    }
-
-    if (key) {
-      if (key.dims.length === 5 && key.dims[3] === 2) {
-        throw new Error('bias is not allowed for packed kv.');
-      }
-    }
-  }
+  validateBias(bias, key);
 
   const totalSequenceLength = pastSequenceLength + kvSequenceLength;
 
-  let maskType: AttentionMaskType = AttentionMaskType.none;
-  if (keyPaddingMask && ShapeUtil.size(keyPaddingMask.dims) > 0) {
-    maskType = AttentionMaskType.maskUnknown;
-    const maskDims = keyPaddingMask.dims;
-    if (maskDims.length === 1) {
-      if (maskDims[0] === batchSize) {
-        maskType = AttentionMaskType.mask1dKeySeqLen;
-      } else if (maskDims[0] === 3 * batchSize + 2) {
-        maskType = AttentionMaskType.mask1DKeySeqLenStart;
-      }
-    } else if (maskDims.length === 2 && maskDims[0] === batchSize && maskDims[1] === totalSequenceLength) {
-      maskType = AttentionMaskType.mask2dKeyPadding;
-    }
-    if (maskType === AttentionMaskType.maskUnknown) {
-      throw new Error('Input "key_padding_mask" shape shall be (batch_size) or (batch_size, total_sequence_length)');
-    }
-    throw new Error('Mask not supported');
-  }
+  const maskType = validateKeyPaddingMask(keyPaddingMask, batchSize, totalSequenceLength);
 
-  let passPastInKv = false;
-  let vHiddenSize = hiddenSize;
-  if (value && ShapeUtil.size(value.dims) > 0) {
-    if (value.dims.length !== 3 && value.dims.length !== 4) {
-      throw new Error('Input "value" is expected to have 3 or 4 dimensions');
-    }
-
-    if (query.dims[0] !== value.dims[0]) {
-      throw new Error('Input "query" and "value" shall have same dim 0 (batch_size)');
-    }
-
-    if (value.dims.length === 3) {
-      if (kvSequenceLength !== value.dims[1]) {
-        throw new Error('Input "key" and "value" shall have the same dim 1 (kv_sequence_length)');
-      }
-      vHiddenSize = value.dims[2];
-    } else {
-      // Q_K_V_BSNH_BNSH_BNSH
-      if (kvSequenceLength !== value.dims[2]) {
-        throw new Error('Input "key" and "value" shall have the same dim 2 (kv_sequence_length)');
-      }
-      vHiddenSize = value.dims[1] * value.dims[3];
-      passPastInKv = true;
-    }
-  }
+  const { vHiddenSize, passPastInKv } = validateValue(query, value, kvSequenceLength, hiddenSize);
 
   const broadcastResPosBias = false;
 
@@ -224,21 +278,7 @@ const validateInputs = (inputs: readonly TensorView[], attributes: AttentionAttr
     throw new Error('Key padding mask is not supported');
   }
 
-  if (attentionBias && ShapeUtil.size(attentionBias.dims) > 0) {
-    if (attentionBias.dims.length !== 4) {
-      throw new Error('Input "attention_bias" is expected to have 4 dimensions');
-    }
-
-    // TODO: support broadcasting the first and second dimensions of attention_bias.
-    if (
-      attentionBias.dims[0] !== batchSize ||
-      attentionBias.dims[1] !== attributes.numHeads ||
-      attentionBias.dims[2] !== sequenceLength ||
-      attentionBias.dims[3] !== totalSequenceLength
-    ) {
-      throw new Error('Expect "attention_bias" shape (batch_size, num_heads, sequence_length, total_sequence_length)');
-    }
-  }
+  validateAttentionBias(attentionBias, batchSize, attributes.numHeads, sequenceLength, totalSequenceLength);
 
   return {
     batchSize,

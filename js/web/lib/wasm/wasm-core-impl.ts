@@ -697,6 +697,357 @@ export const prepareInputOutputTensor = async (
   }
 };
 
+const isIoBindingEnabled = (ioBindingState: IOBindingState | null): ioBindingState is IOBindingState =>
+  (!BUILD_DEFS.DISABLE_JSEP || !BUILD_DEFS.DISABLE_WEBGPU) && !!ioBindingState;
+
+const setTensorValuesAndNames = (
+  valuesOffset: number,
+  namesOffset: number,
+  tensorHandles: number[],
+  namesUTF8Encoded: number[],
+  indices: number[],
+): void => {
+  const wasm = getInstance();
+  const ptrSize = wasm.PTR_SIZE;
+  for (let i = 0; i < indices.length; i++) {
+    wasm.setValue(valuesOffset + i * ptrSize, tensorHandles[i], '*');
+    wasm.setValue(namesOffset + i * ptrSize, namesUTF8Encoded[indices[i]], '*');
+  }
+};
+
+const bindInputs = async (
+  sessionId: number,
+  handle: number,
+  inputNamesUTF8Encoded: number[],
+  inputIndices: number[],
+  inputTensorHandles: number[],
+): Promise<void> => {
+  const wasm = getInstance();
+  const inputCount = inputIndices.length;
+  if (inputNamesUTF8Encoded.length !== inputCount) {
+    throw new Error(
+      `input count from feeds (${inputCount}) is expected to be always equal to model's input count (${inputNamesUTF8Encoded.length}).`,
+    );
+  }
+
+  // Inputs are bound sequentially, one after another.
+  await inputIndices.reduce(
+    (previous, index, i) =>
+      previous.then(async () => {
+        const errorCode = await wasm._OrtBindInput(handle, inputNamesUTF8Encoded[index], inputTensorHandles[i]);
+        if (errorCode !== 0) {
+          checkLastError(`Can't bind input[${i}] for session=${sessionId}.`);
+        }
+      }),
+    Promise.resolve(),
+  );
+};
+
+const bindOutputs = (
+  sessionId: number,
+  ioBindingState: IOBindingState,
+  outputNamesUTF8Encoded: number[],
+  outputIndices: number[],
+  outputTensors: Array<TensorMetadata | null>,
+  outputTensorHandles: number[],
+  preAllocatedOutputs: number[],
+): void => {
+  const wasm = getInstance();
+  const { handle, outputPreferredLocations, outputPreferredLocationsEncoded } = ioBindingState;
+  for (let i = 0; i < outputIndices.length; i++) {
+    const index = outputIndices[i];
+    const location = outputTensors[i]?.[3]; // undefined means output is not pre-allocated.
+
+    if (location) {
+      // output is pre-allocated, store and bind the tensor.
+      preAllocatedOutputs.push(outputTensorHandles[i]);
+      const errorCode = wasm._OrtBindOutput(handle, outputNamesUTF8Encoded[index], outputTensorHandles[i], 0);
+      if (errorCode !== 0) {
+        checkLastError(`Can't bind pre-allocated output[${i}] for session=${sessionId}.`);
+      }
+    } else {
+      // output is not pre-allocated. reset preferred location.
+      const errorCode = wasm._OrtBindOutput(
+        handle,
+        outputNamesUTF8Encoded[index],
+        0,
+        outputPreferredLocationsEncoded[index],
+      );
+      if (errorCode !== 0) {
+        checkLastError(`Can't bind output[${i}] to ${outputPreferredLocations[i]} for session=${sessionId}.`);
+      }
+    }
+  }
+};
+
+const clearBoundOutputs = (handle: number): void => {
+  if (getInstance()._OrtClearBoundOutputs(handle) !== 0) {
+    checkLastError("Can't clear bound outputs.");
+  }
+};
+
+const unregisterGpuBuffers = (tensors: Array<TensorMetadata | null>): void => {
+  if (BUILD_DEFS.DISABLE_WEBGPU) {
+    return;
+  }
+  const wasm = getInstance();
+  tensors.forEach((t) => {
+    if (t && t[3] === 'gpu-buffer') {
+      wasm.webgpuUnregisterBuffer!(t[2].gpuBuffer);
+    }
+  });
+};
+
+type RunOutputContext = {
+  sessionId: number;
+  ioBindingState: IOBindingState | null;
+  outputIndices: number[];
+  outputTensors: Array<TensorMetadata | null>;
+  outputTensorHandles: number[];
+  preAllocatedOutputs: number[];
+  outputValuesOffset: number;
+  output: TensorMetadata[];
+  outputPromises: Array<Promise<[number, Tensor.DataType]>>;
+};
+
+type OutputTensorInfo = {
+  tensor: number;
+  type: Tensor.Type;
+  dataType: number;
+  dims: number[];
+  size: number;
+  dataOffset: number;
+};
+
+const readStringTensorData = (dataOffset: number, size: number): string[] => {
+  const wasm = getInstance();
+  const ptrSize = wasm.PTR_SIZE;
+  const stringData: string[] = [];
+  for (let i = 0; i < size; i++) {
+    const offset = wasm.getValue(dataOffset + i * ptrSize, '*');
+    const nextOffset = wasm.getValue(dataOffset + (i + 1) * ptrSize, '*');
+    const maxBytesToRead = i === size - 1 ? undefined : nextOffset - offset;
+    stringData.push(wasm.UTF8ToString(offset, maxBytesToRead));
+  }
+  return stringData;
+};
+
+const createGpuBufferOutputTensor = (sessionId: number, info: OutputTensorInfo): TensorMetadata => {
+  const wasm = getInstance();
+  const { tensor, type, dataType, dims, size, dataOffset } = info;
+  const getBuffer = !BUILD_DEFS.DISABLE_WEBGPU ? wasm.webgpuGetBuffer : wasm.jsepGetBuffer;
+  if (!getBuffer) {
+    throw new Error('preferredLocation "gpu-buffer" is not supported without using WebGPU.');
+  }
+  const gpuBuffer = getBuffer(dataOffset);
+  const bufferSize = calculateTensorSizeInBytes(dataType, size);
+  if (bufferSize === undefined || !isGpuBufferSupportedType(type)) {
+    throw new Error(`Unsupported data type: ${type}`);
+  }
+
+  const dispose = () => {
+    if (wasm._OrtReleaseTensor(tensor) !== 0) {
+      checkLastError("Can't release tensor.");
+    }
+  };
+
+  if (!BUILD_DEFS.DISABLE_WEBGPU) {
+    wasm.webgpuRegisterBuffer!(gpuBuffer, sessionId, dataOffset);
+    const downloadDataFunction = wasm.webgpuCreateDownloader!(gpuBuffer, bufferSize, sessionId);
+    return [
+      type,
+      dims,
+      {
+        gpuBuffer,
+        download: async () => {
+          const arrayBuffer = await downloadDataFunction();
+          const data = new (tensorTypeToTypedArrayConstructor(type))(arrayBuffer);
+          return data as Tensor.DataTypeMap[Tensor.GpuBufferDataTypes];
+        },
+        dispose,
+      },
+      'gpu-buffer',
+    ];
+  }
+  return [
+    type,
+    dims,
+    {
+      gpuBuffer,
+      download: wasm.jsepCreateDownloader!(gpuBuffer, bufferSize, type),
+      dispose,
+    },
+    'gpu-buffer',
+  ];
+};
+
+const createMLTensorOutputTensor = async (sessionId: number, info: OutputTensorInfo): Promise<TensorMetadata> => {
+  const wasm = getInstance();
+  const { tensor, type, dataType, dims, size, dataOffset } = info;
+  const ensureTensor = wasm.webnnEnsureTensor;
+  const isGraphInputOutputTypeSupported = wasm.webnnIsGraphInputOutputTypeSupported;
+  if (!ensureTensor || !isGraphInputOutputTypeSupported) {
+    throw new Error('preferredLocation "ml-tensor" is not supported without using WebNN.');
+  }
+  const tensorSize = calculateTensorSizeInBytes(dataType, size);
+  if (tensorSize === undefined || !isMLTensorSupportedType(type)) {
+    throw new Error(`Unsupported data type: ${type}`);
+  }
+  if (!isGraphInputOutputTypeSupported(sessionId, type, false)) {
+    throw new Error(`preferredLocation "ml-tensor" for ${type} output is not supported by current WebNN Context.`);
+  }
+
+  // If the graph has been partitioned, the output tensor may have not been created. For this reason, we use
+  // ensureTensor to get/create the MLTensor. In which case, we don't need to copy the data if a new tensor
+  // has been created.
+  const mlTensor = await ensureTensor(sessionId, dataOffset, dataType, dims, false);
+
+  return [
+    type,
+    dims,
+    {
+      mlTensor,
+      download: wasm.webnnCreateMLTensorDownloader!(dataOffset, type),
+      dispose: () => {
+        wasm.webnnReleaseTensorId!(dataOffset);
+        wasm._OrtReleaseTensor(tensor);
+      },
+    },
+    'ml-tensor',
+  ];
+};
+
+/**
+ * create the output tensor metadata for a non-string tensor.
+ * @returns whether the output tensor should be kept (not released immediately).
+ */
+const createNonStringOutputTensor = async (
+  ctx: RunOutputContext,
+  info: OutputTensorInfo,
+  preferredLocation: SupportedTensorDataLocationForInputOutput | undefined,
+): Promise<boolean> => {
+  const wasm = getInstance();
+  const { tensor, type, dims, size, dataOffset } = info;
+  const output = ctx.output;
+  // If a certain output's preferred location is GPU but the tensor is empty, we still need to create a CPU
+  // tensor for it. There is no mapping GPU buffer for an empty tensor.
+  if (preferredLocation === 'gpu-buffer' && size > 0) {
+    // do not release the tensor right now. it will be released when user calls tensor.dispose().
+    output.push(createGpuBufferOutputTensor(ctx.sessionId, info));
+    return true;
+  }
+  if (preferredLocation === 'ml-tensor' && size > 0) {
+    // do not release the tensor right now. it will be released when user calls tensor.dispose().
+    output.push(await createMLTensorOutputTensor(ctx.sessionId, info));
+    return true;
+  }
+  if (preferredLocation === 'ml-tensor-cpu-output' && size > 0) {
+    const data = wasm.webnnCreateMLTensorDownloader!(dataOffset, type as Tensor.MLTensorDataTypes)();
+    const index = output.length;
+    // Delay the data download and releasing the tensor until we can wait for all output tensors to be downloaded.
+    ctx.outputPromises.push(
+      (async () => {
+        const result: [number, Tensor.DataType] = [index, await data];
+        wasm.webnnReleaseTensorId!(dataOffset);
+        wasm._OrtReleaseTensor(tensor);
+        return result;
+      })(),
+    );
+    output.push([type, dims, [], 'cpu']);
+    return true;
+  }
+  const typedArrayConstructor = tensorTypeToTypedArrayConstructor(type);
+  const data = new typedArrayConstructor(size);
+  new Uint8Array(data.buffer, data.byteOffset, data.byteLength).set(
+    wasm.HEAPU8.subarray(dataOffset, dataOffset + data.byteLength),
+  );
+  output.push([type, dims, data, 'cpu']);
+  return false;
+};
+
+const readOutputTensor = async (ctx: RunOutputContext, i: number, tensor: number): Promise<void> => {
+  const wasm = getInstance();
+  const ptrSize = wasm.PTR_SIZE;
+  const beforeGetTensorDataStack = wasm.stackSave();
+  // stack allocate 4 pointer value
+  const tensorDataOffset = wasm.stackAlloc(4 * ptrSize);
+
+  let keepOutputTensor = false;
+  let type: Tensor.Type | undefined,
+    dataOffset = 0;
+  try {
+    const errorCode = wasm._OrtGetTensorData(
+      tensor,
+      tensorDataOffset,
+      tensorDataOffset + ptrSize,
+      tensorDataOffset + 2 * ptrSize,
+
+      tensorDataOffset + 3 * ptrSize,
+    );
+    if (errorCode !== 0) {
+      checkLastError(`Can't access output tensor data on index ${i}.`);
+    }
+    const valueType = ptrSize === 4 ? 'i32' : 'i64';
+    const dataType = Number(wasm.getValue(tensorDataOffset, valueType));
+    dataOffset = wasm.getValue(tensorDataOffset + ptrSize, '*');
+    const dimsOffset = wasm.getValue(tensorDataOffset + ptrSize * 2, '*');
+    const dimsLength = Number(wasm.getValue(tensorDataOffset + ptrSize * 3, valueType));
+    const dims: number[] = [];
+    for (let d = 0; d < dimsLength; d++) {
+      dims.push(Number(wasm.getValue(dimsOffset + d * ptrSize, valueType)));
+    }
+    if (wasm._OrtFree(dimsOffset) !== 0) {
+      checkLastError("Can't free memory for tensor dims.");
+    }
+    const size = dims.reduce((a, b) => a * b, 1);
+    type = tensorDataTypeEnumToString(dataType);
+
+    const preferredLocation = ctx.ioBindingState?.outputPreferredLocations[ctx.outputIndices[i]];
+
+    if (type === 'string') {
+      if (preferredLocation === 'gpu-buffer' || preferredLocation === 'ml-tensor') {
+        throw new Error('String tensor is not supported on GPU.');
+      }
+      ctx.output.push([type, dims, readStringTensorData(dataOffset, size), 'cpu']);
+    } else {
+      keepOutputTensor = await createNonStringOutputTensor(
+        ctx,
+        { tensor, type, dataType, dims, size, dataOffset },
+        preferredLocation,
+      );
+    }
+  } finally {
+    wasm.stackRestore(beforeGetTensorDataStack);
+    if (type === 'string' && dataOffset) {
+      wasm._free(dataOffset);
+    }
+    if (!keepOutputTensor) {
+      wasm._OrtReleaseTensor(tensor);
+    }
+  }
+};
+
+const processOutputTensor = async (ctx: RunOutputContext, i: number): Promise<void> => {
+  const wasm = getInstance();
+  const tensor = Number(wasm.getValue(ctx.outputValuesOffset + i * wasm.PTR_SIZE, '*'));
+  const tensorHandle = ctx.outputTensorHandles[i];
+  // TODO: revisit this part to ensure it works for WebGPU when both pre-allocated outputs and
+  // preferred location are specified.
+  // Certain pre-allocated tensors may already be bound in the IO binding. e.g. the WebNN backend
+  // always binds its tensor to 'ml-tensor'. In such cases, the tensor ID might change after binding,
+  // but copying data for these tensors should still be avoided.
+  if (tensor === tensorHandle || ctx.preAllocatedOutputs.includes(tensorHandle)) {
+    // output tensor is pre-allocated. no need to copy data.
+    ctx.output.push(ctx.outputTensors[i]!);
+    // release redundant tensor earlier.
+    if (tensor !== tensorHandle && wasm._OrtReleaseTensor(tensor) !== 0) {
+      checkLastError("Can't release tensor.");
+    }
+    return;
+  }
+  await readOutputTensor(ctx, i, tensor);
+};
+
 /**
  * perform inference run
  */
@@ -769,59 +1120,33 @@ export const run = async (
     }
     TRACE_EVENT_END('wasm prepareInputOutputTensor');
 
-    for (let i = 0; i < inputCount; i++) {
-      wasm.setValue(inputValuesOffset + i * ptrSize, inputTensorHandles[i], '*');
-      wasm.setValue(inputNamesOffset + i * ptrSize, inputNamesUTF8Encoded[inputIndices[i]], '*');
-    }
-    for (let i = 0; i < outputCount; i++) {
-      wasm.setValue(outputValuesOffset + i * ptrSize, outputTensorHandles[i], '*');
-      wasm.setValue(outputNamesOffset + i * ptrSize, outputNamesUTF8Encoded[outputIndices[i]], '*');
-    }
+    setTensorValuesAndNames(
+      inputValuesOffset,
+      inputNamesOffset,
+      inputTensorHandles,
+      inputNamesUTF8Encoded,
+      inputIndices,
+    );
+    setTensorValuesAndNames(
+      outputValuesOffset,
+      outputNamesOffset,
+      outputTensorHandles,
+      outputNamesUTF8Encoded,
+      outputIndices,
+    );
 
-    if ((!BUILD_DEFS.DISABLE_JSEP || !BUILD_DEFS.DISABLE_WEBGPU) && ioBindingState && !inputOutputBound) {
-      const { handle, outputPreferredLocations, outputPreferredLocationsEncoded } = ioBindingState;
-
-      if (inputNamesUTF8Encoded.length !== inputCount) {
-        throw new Error(
-          `input count from feeds (${inputCount}) is expected to be always equal to model's input count (${inputNamesUTF8Encoded.length}).`,
-        );
-      }
-
+    if (isIoBindingEnabled(ioBindingState) && !inputOutputBound) {
       TRACE_EVENT_BEGIN('wasm bindInputsOutputs');
-      // process inputs
-      for (let i = 0; i < inputCount; i++) {
-        const index = inputIndices[i];
-        const errorCode = await wasm._OrtBindInput(handle, inputNamesUTF8Encoded[index], inputTensorHandles[i]);
-        if (errorCode !== 0) {
-          checkLastError(`Can't bind input[${i}] for session=${sessionId}.`);
-        }
-      }
-
-      // process pre-allocated outputs
-      for (let i = 0; i < outputCount; i++) {
-        const index = outputIndices[i];
-        const location = outputTensors[i]?.[3]; // undefined means output is not pre-allocated.
-
-        if (location) {
-          // output is pre-allocated, store and bind the tensor.
-          preAllocatedOutputs.push(outputTensorHandles[i]);
-          const errorCode = wasm._OrtBindOutput(handle, outputNamesUTF8Encoded[index], outputTensorHandles[i], 0);
-          if (errorCode !== 0) {
-            checkLastError(`Can't bind pre-allocated output[${i}] for session=${sessionId}.`);
-          }
-        } else {
-          // output is not pre-allocated. reset preferred location.
-          const errorCode = wasm._OrtBindOutput(
-            handle,
-            outputNamesUTF8Encoded[index],
-            0,
-            outputPreferredLocationsEncoded[index],
-          );
-          if (errorCode !== 0) {
-            checkLastError(`Can't bind output[${i}] to ${outputPreferredLocations[i]} for session=${sessionId}.`);
-          }
-        }
-      }
+      await bindInputs(sessionId, ioBindingState.handle, inputNamesUTF8Encoded, inputIndices, inputTensorHandles);
+      bindOutputs(
+        sessionId,
+        ioBindingState,
+        outputNamesUTF8Encoded,
+        outputIndices,
+        outputTensors,
+        outputTensorHandles,
+        preAllocatedOutputs,
+      );
       TRACE_EVENT_END('wasm bindInputsOutputs');
       activeSessions.set(sessionId, [
         sessionHandle,
@@ -837,7 +1162,7 @@ export const run = async (
     wasm.webnnOnRunStart?.(sessionHandle);
 
     let errorCode: number;
-    if ((!BUILD_DEFS.DISABLE_JSEP || !BUILD_DEFS.DISABLE_WEBGPU) && ioBindingState) {
+    if (isIoBindingEnabled(ioBindingState)) {
       errorCode = await wasm._OrtRunWithBinding(
         sessionHandle,
         ioBindingState.handle,
@@ -866,202 +1191,25 @@ export const run = async (
     const outputPromises: Array<Promise<[number, Tensor.DataType]>> = [];
 
     TRACE_EVENT_BEGIN('wasm ProcessOutputTensor');
-    for (let i = 0; i < outputCount; i++) {
-      const tensor = Number(wasm.getValue(outputValuesOffset + i * ptrSize, '*'));
-      // TODO: revisit this part to ensure it works for WebGPU when both pre-allocated outputs and
-      // preferred location are specified.
-      // Certain pre-allocated tensors may already be bound in the IO binding. e.g. the WebNN backend
-      // always binds its tensor to 'ml-tensor'. In such cases, the tensor ID might change after binding,
-      // but copying data for these tensors should still be avoided.
-      if (tensor === outputTensorHandles[i] || preAllocatedOutputs.includes(outputTensorHandles[i])) {
-        // output tensor is pre-allocated. no need to copy data.
-        output.push(outputTensors[i]!);
-        if (tensor !== outputTensorHandles[i]) {
-          // release redundant tensor earlier.
-          if (wasm._OrtReleaseTensor(tensor) !== 0) {
-            checkLastError("Can't release tensor.");
-          }
-        }
-        continue;
-      }
-
-      const beforeGetTensorDataStack = wasm.stackSave();
-      // stack allocate 4 pointer value
-      const tensorDataOffset = wasm.stackAlloc(4 * ptrSize);
-
-      let keepOutputTensor = false;
-      let type: Tensor.Type | undefined,
-        dataOffset = 0;
-      try {
-        const errorCode = wasm._OrtGetTensorData(
-          tensor,
-          tensorDataOffset,
-          tensorDataOffset + ptrSize,
-          tensorDataOffset + 2 * ptrSize,
-
-          tensorDataOffset + 3 * ptrSize,
-        );
-        if (errorCode !== 0) {
-          checkLastError(`Can't access output tensor data on index ${i}.`);
-        }
-        const valueType = ptrSize === 4 ? 'i32' : 'i64';
-        const dataType = Number(wasm.getValue(tensorDataOffset, valueType));
-        dataOffset = wasm.getValue(tensorDataOffset + ptrSize, '*');
-        const dimsOffset = wasm.getValue(tensorDataOffset + ptrSize * 2, '*');
-        const dimsLength = Number(wasm.getValue(tensorDataOffset + ptrSize * 3, valueType));
-        const dims = [];
-        for (let i = 0; i < dimsLength; i++) {
-          dims.push(Number(wasm.getValue(dimsOffset + i * ptrSize, valueType)));
-        }
-        if (wasm._OrtFree(dimsOffset) !== 0) {
-          checkLastError("Can't free memory for tensor dims.");
-        }
-        const size = dims.reduce((a, b) => a * b, 1);
-        type = tensorDataTypeEnumToString(dataType);
-
-        const preferredLocation = ioBindingState?.outputPreferredLocations[outputIndices[i]];
-
-        if (type === 'string') {
-          if (preferredLocation === 'gpu-buffer' || preferredLocation === 'ml-tensor') {
-            throw new Error('String tensor is not supported on GPU.');
-          }
-          const stringData: string[] = [];
-          for (let i = 0; i < size; i++) {
-            const offset = wasm.getValue(dataOffset + i * ptrSize, '*');
-            const nextOffset = wasm.getValue(dataOffset + (i + 1) * ptrSize, '*');
-            const maxBytesToRead = i === size - 1 ? undefined : nextOffset - offset;
-            stringData.push(wasm.UTF8ToString(offset, maxBytesToRead));
-          }
-          output.push([type, dims, stringData, 'cpu']);
-        } else {
-          // If a certain output's preferred location is GPU but the tensor is empty, we still need to create a CPU
-          // tensor for it. There is no mapping GPU buffer for an empty tensor.
-          if (preferredLocation === 'gpu-buffer' && size > 0) {
-            const getBuffer = !BUILD_DEFS.DISABLE_WEBGPU ? wasm.webgpuGetBuffer : wasm.jsepGetBuffer;
-            if (!getBuffer) {
-              throw new Error('preferredLocation "gpu-buffer" is not supported without using WebGPU.');
-            }
-            const gpuBuffer = getBuffer(dataOffset);
-            const bufferSize = calculateTensorSizeInBytes(dataType, size);
-            if (bufferSize === undefined || !isGpuBufferSupportedType(type)) {
-              throw new Error(`Unsupported data type: ${type}`);
-            }
-
-            // do not release the tensor right now. it will be released when user calls tensor.dispose().
-            keepOutputTensor = true;
-
-            if (!BUILD_DEFS.DISABLE_WEBGPU) {
-              wasm.webgpuRegisterBuffer!(gpuBuffer, sessionId, dataOffset);
-              const downloadDataFunction = wasm.webgpuCreateDownloader!(gpuBuffer, bufferSize, sessionId);
-              output.push([
-                type,
-                dims,
-                {
-                  gpuBuffer,
-                  download: async () => {
-                    const arrayBuffer = await downloadDataFunction();
-                    const data = new (tensorTypeToTypedArrayConstructor(type!))(arrayBuffer);
-                    return data as Tensor.DataTypeMap[Tensor.GpuBufferDataTypes];
-                  },
-                  dispose: () => {
-                    if (wasm._OrtReleaseTensor(tensor) !== 0) {
-                      checkLastError("Can't release tensor.");
-                    }
-                  },
-                },
-                'gpu-buffer',
-              ]);
-            } else {
-              output.push([
-                type,
-                dims,
-                {
-                  gpuBuffer,
-                  download: wasm.jsepCreateDownloader!(gpuBuffer, bufferSize, type),
-                  dispose: () => {
-                    if (wasm._OrtReleaseTensor(tensor) !== 0) {
-                      checkLastError("Can't release tensor.");
-                    }
-                  },
-                },
-                'gpu-buffer',
-              ]);
-            }
-          } else if (preferredLocation === 'ml-tensor' && size > 0) {
-            const ensureTensor = wasm.webnnEnsureTensor;
-            const isGraphInputOutputTypeSupported = wasm.webnnIsGraphInputOutputTypeSupported;
-            if (!ensureTensor || !isGraphInputOutputTypeSupported) {
-              throw new Error('preferredLocation "ml-tensor" is not supported without using WebNN.');
-            }
-            const tensorSize = calculateTensorSizeInBytes(dataType, size);
-            if (tensorSize === undefined || !isMLTensorSupportedType(type)) {
-              throw new Error(`Unsupported data type: ${type}`);
-            }
-            if (!isGraphInputOutputTypeSupported(sessionId, type, false)) {
-              throw new Error(
-                `preferredLocation "ml-tensor" for ${type} output is not supported by current WebNN Context.`,
-              );
-            }
-
-            // If the graph has been partitioned, the output tensor may have not been created. For this reason, we use
-            // ensureTensor to get/create the MLTensor. In which case, we don't need to copy the data if a new tensor
-            // has been created.
-            const mlTensor = await ensureTensor(sessionId, dataOffset, dataType, dims, false);
-
-            // do not release the tensor right now. it will be released when user calls tensor.dispose().
-            keepOutputTensor = true;
-
-            output.push([
-              type,
-              dims,
-              {
-                mlTensor,
-                download: wasm.webnnCreateMLTensorDownloader!(dataOffset, type),
-                dispose: () => {
-                  wasm.webnnReleaseTensorId!(dataOffset);
-                  wasm._OrtReleaseTensor(tensor);
-                },
-              },
-              'ml-tensor',
-            ]);
-          } else if (preferredLocation === 'ml-tensor-cpu-output' && size > 0) {
-            const data = wasm.webnnCreateMLTensorDownloader!(dataOffset, type as Tensor.MLTensorDataTypes)();
-            const index = output.length;
-            // Delay the data download and releasing the tensor until we can wait for all output tensors to be downloaded.
-            keepOutputTensor = true;
-            outputPromises.push(
-              (async () => {
-                const result: [number, Tensor.DataType] = [index, await data];
-                wasm.webnnReleaseTensorId!(dataOffset);
-                wasm._OrtReleaseTensor(tensor);
-                return result;
-              })(),
-            );
-            output.push([type, dims, [], 'cpu']);
-          } else {
-            const typedArrayConstructor = tensorTypeToTypedArrayConstructor(type);
-            const data = new typedArrayConstructor(size);
-            new Uint8Array(data.buffer, data.byteOffset, data.byteLength).set(
-              wasm.HEAPU8.subarray(dataOffset, dataOffset + data.byteLength),
-            );
-            output.push([type, dims, data, 'cpu']);
-          }
-        }
-      } finally {
-        wasm.stackRestore(beforeGetTensorDataStack);
-        if (type === 'string' && dataOffset) {
-          wasm._free(dataOffset);
-        }
-        if (!keepOutputTensor) {
-          wasm._OrtReleaseTensor(tensor);
-        }
-      }
-    }
+    const outputContext: RunOutputContext = {
+      sessionId,
+      ioBindingState,
+      outputIndices,
+      outputTensors,
+      outputTensorHandles,
+      preAllocatedOutputs,
+      outputValuesOffset,
+      output,
+      outputPromises,
+    };
+    // Output tensors must be processed sequentially to keep the output order and the wasm stack consistent.
+    await outputIndices.reduce(
+      (previous, _, i) => previous.then(() => processOutputTensor(outputContext, i)),
+      Promise.resolve(),
+    );
 
     if (ioBindingState && !enableGraphCapture) {
-      if (wasm._OrtClearBoundOutputs(ioBindingState.handle) !== 0) {
-        checkLastError("Can't clear bound outputs.");
-      }
+      clearBoundOutputs(ioBindingState.handle);
       activeSessions.set(sessionId, [
         sessionHandle,
         inputNamesUTF8Encoded,
@@ -1082,18 +1230,8 @@ export const run = async (
 
     wasm.stackRestore(beforeRunStack);
 
-    if (!BUILD_DEFS.DISABLE_WEBGPU) {
-      inputTensors.forEach((t) => {
-        if (t && t[3] === 'gpu-buffer') {
-          wasm.webgpuUnregisterBuffer!(t[2].gpuBuffer);
-        }
-      });
-      outputTensors.forEach((t) => {
-        if (t && t[3] === 'gpu-buffer') {
-          wasm.webgpuUnregisterBuffer!(t[2].gpuBuffer);
-        }
-      });
-    }
+    unregisterGpuBuffers(inputTensors);
+    unregisterGpuBuffers(outputTensors);
     inputTensorHandles.forEach((v) => wasm._OrtReleaseTensor(v));
     outputTensorHandles.forEach((v) => wasm._OrtReleaseTensor(v));
     inputOutputAllocs.forEach((p) => wasm._free(p));

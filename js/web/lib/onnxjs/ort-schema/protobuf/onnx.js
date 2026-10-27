@@ -4000,8 +4000,78 @@ $root.onnx = (function () {
      * @returns {Object.<string,*>} Plain object
      */
     TensorProto.toObject = function toObject(message, options) {
-      if (!options) options = {};
+      options = options || {};
       var object = {};
+      applyToObjectDefaults(object, options);
+      leadingFieldsToObject(message, object, options);
+      trailingFieldsToObject(message, object, options);
+      return object;
+    };
+
+    function hasField(message, name) {
+      return message[name] != null && message.hasOwnProperty(name);
+    }
+
+    function convertArray(values, convert) {
+      var result = [];
+      for (var j = 0; j < values.length; ++j) result[j] = convert(values[j]);
+      return result;
+    }
+
+    function convertLong(value, options, unsigned) {
+      if (typeof value === 'number') return options.longs === String ? String(value) : value;
+      if (options.longs === String) return $util.Long.prototype.toString.call(value);
+      if (options.longs === Number) return new $util.LongBits(value.low >>> 0, value.high >>> 0).toNumber(unsigned);
+      return value;
+    }
+
+    function convertBytes(value, options) {
+      if (options.bytes === String) return $util.base64.encode(value, 0, value.length);
+      if (options.bytes === Array) return Array.prototype.slice.call(value);
+      return value;
+    }
+
+    function convertFloat(value, options) {
+      return options.json && !isFinite(value) ? String(value) : value;
+    }
+
+    function convertDataLocation(value, options) {
+      if (options.enums !== String) return value;
+      var name = $root.onnx.TensorProto.DataLocation[value];
+      return name === undefined ? value : name;
+    }
+
+    function leadingFieldsToObject(message, object, options) {
+      if (message.dims?.length) object.dims = convertArray(message.dims, (v) => convertLong(v, options, false));
+      if (hasField(message, 'dataType')) object.dataType = message.dataType;
+      if (hasField(message, 'segment'))
+        object.segment = $root.onnx.TensorProto.Segment.toObject(message.segment, options);
+      if (message.floatData?.length)
+        object.floatData = convertArray(message.floatData, (v) => convertFloat(v, options));
+      if (message.int32Data?.length) object.int32Data = convertArray(message.int32Data, (v) => v);
+      if (message.stringData?.length)
+        object.stringData = convertArray(message.stringData, (v) => convertBytes(v, options));
+      if (message.int64Data?.length)
+        object.int64Data = convertArray(message.int64Data, (v) => convertLong(v, options, false));
+    }
+
+    function trailingFieldsToObject(message, object, options) {
+      if (hasField(message, 'name')) object.name = message.name;
+      if (hasField(message, 'rawData')) object.rawData = convertBytes(message.rawData, options);
+      if (message.doubleData?.length)
+        object.doubleData = convertArray(message.doubleData, (v) => convertFloat(v, options));
+      if (message.uint64Data?.length)
+        object.uint64Data = convertArray(message.uint64Data, (v) => convertLong(v, options, true));
+      if (hasField(message, 'docString')) object.docString = message.docString;
+      if (message.externalData?.length)
+        object.externalData = convertArray(message.externalData, (v) =>
+          $root.onnx.StringStringEntryProto.toObject(v, options),
+        );
+      if (hasField(message, 'dataLocation'))
+        object.dataLocation = convertDataLocation(message.dataLocation, options);
+    }
+
+    function applyToObjectDefaults(object, options) {
       if (options.arrays || options.defaults) {
         object.dims = [];
         object.floatData = [];
@@ -4024,97 +4094,7 @@ $root.onnx = (function () {
         object.docString = '';
         object.dataLocation = options.enums === String ? 'DEFAULT' : 0;
       }
-      if (message.dims && message.dims.length) {
-        object.dims = [];
-        for (var j = 0; j < message.dims.length; ++j)
-          if (typeof message.dims[j] === 'number')
-            object.dims[j] = options.longs === String ? String(message.dims[j]) : message.dims[j];
-          else
-            object.dims[j] =
-              options.longs === String
-                ? $util.Long.prototype.toString.call(message.dims[j])
-                : options.longs === Number
-                  ? new $util.LongBits(message.dims[j].low >>> 0, message.dims[j].high >>> 0).toNumber()
-                  : message.dims[j];
-      }
-      if (message.dataType != null && message.hasOwnProperty('dataType')) object.dataType = message.dataType;
-      if (message.segment != null && message.hasOwnProperty('segment'))
-        object.segment = $root.onnx.TensorProto.Segment.toObject(message.segment, options);
-      if (message.floatData && message.floatData.length) {
-        object.floatData = [];
-        for (var j = 0; j < message.floatData.length; ++j)
-          object.floatData[j] =
-            options.json && !isFinite(message.floatData[j]) ? String(message.floatData[j]) : message.floatData[j];
-      }
-      if (message.int32Data && message.int32Data.length) {
-        object.int32Data = [];
-        for (var j = 0; j < message.int32Data.length; ++j) object.int32Data[j] = message.int32Data[j];
-      }
-      if (message.stringData && message.stringData.length) {
-        object.stringData = [];
-        for (var j = 0; j < message.stringData.length; ++j)
-          object.stringData[j] =
-            options.bytes === String
-              ? $util.base64.encode(message.stringData[j], 0, message.stringData[j].length)
-              : options.bytes === Array
-                ? Array.prototype.slice.call(message.stringData[j])
-                : message.stringData[j];
-      }
-      if (message.int64Data && message.int64Data.length) {
-        object.int64Data = [];
-        for (var j = 0; j < message.int64Data.length; ++j)
-          if (typeof message.int64Data[j] === 'number')
-            object.int64Data[j] = options.longs === String ? String(message.int64Data[j]) : message.int64Data[j];
-          else
-            object.int64Data[j] =
-              options.longs === String
-                ? $util.Long.prototype.toString.call(message.int64Data[j])
-                : options.longs === Number
-                  ? new $util.LongBits(message.int64Data[j].low >>> 0, message.int64Data[j].high >>> 0).toNumber()
-                  : message.int64Data[j];
-      }
-      if (message.name != null && message.hasOwnProperty('name')) object.name = message.name;
-      if (message.rawData != null && message.hasOwnProperty('rawData'))
-        object.rawData =
-          options.bytes === String
-            ? $util.base64.encode(message.rawData, 0, message.rawData.length)
-            : options.bytes === Array
-              ? Array.prototype.slice.call(message.rawData)
-              : message.rawData;
-      if (message.doubleData && message.doubleData.length) {
-        object.doubleData = [];
-        for (var j = 0; j < message.doubleData.length; ++j)
-          object.doubleData[j] =
-            options.json && !isFinite(message.doubleData[j]) ? String(message.doubleData[j]) : message.doubleData[j];
-      }
-      if (message.uint64Data && message.uint64Data.length) {
-        object.uint64Data = [];
-        for (var j = 0; j < message.uint64Data.length; ++j)
-          if (typeof message.uint64Data[j] === 'number')
-            object.uint64Data[j] = options.longs === String ? String(message.uint64Data[j]) : message.uint64Data[j];
-          else
-            object.uint64Data[j] =
-              options.longs === String
-                ? $util.Long.prototype.toString.call(message.uint64Data[j])
-                : options.longs === Number
-                  ? new $util.LongBits(message.uint64Data[j].low >>> 0, message.uint64Data[j].high >>> 0).toNumber(true)
-                  : message.uint64Data[j];
-      }
-      if (message.docString != null && message.hasOwnProperty('docString')) object.docString = message.docString;
-      if (message.externalData && message.externalData.length) {
-        object.externalData = [];
-        for (var j = 0; j < message.externalData.length; ++j)
-          object.externalData[j] = $root.onnx.StringStringEntryProto.toObject(message.externalData[j], options);
-      }
-      if (message.dataLocation != null && message.hasOwnProperty('dataLocation'))
-        object.dataLocation =
-          options.enums === String
-            ? $root.onnx.TensorProto.DataLocation[message.dataLocation] === undefined
-              ? message.dataLocation
-              : $root.onnx.TensorProto.DataLocation[message.dataLocation]
-            : message.dataLocation;
-      return object;
-    };
+    }
 
     /**
      * Converts this TensorProto to JSON.
