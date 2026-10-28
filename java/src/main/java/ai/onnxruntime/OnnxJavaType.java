@@ -124,24 +124,36 @@ public enum OnnxJavaType {
    * @return An OnnxJavaType instance.
    */
   public static OnnxJavaType mapFromClass(Class<?> clazz) {
-    if (clazz.equals(Byte.TYPE) || clazz.equals(Byte.class)) {
+    if (isType(clazz, Byte.TYPE, Byte.class)) {
       return OnnxJavaType.INT8;
-    } else if (clazz.equals(Short.TYPE) || clazz.equals(Short.class)) {
+    } else if (isType(clazz, Short.TYPE, Short.class)) {
       return OnnxJavaType.INT16;
-    } else if (clazz.equals(Integer.TYPE) || clazz.equals(Integer.class)) {
+    } else if (isType(clazz, Integer.TYPE, Integer.class)) {
       return OnnxJavaType.INT32;
-    } else if (clazz.equals(Long.TYPE) || clazz.equals(Long.class)) {
+    } else if (isType(clazz, Long.TYPE, Long.class)) {
       return OnnxJavaType.INT64;
-    } else if (clazz.equals(Float.TYPE) || clazz.equals(Float.class)) {
+    } else if (isType(clazz, Float.TYPE, Float.class)) {
       return OnnxJavaType.FLOAT;
-    } else if (clazz.equals(Double.TYPE) || clazz.equals(Double.class)) {
+    } else if (isType(clazz, Double.TYPE, Double.class)) {
       return OnnxJavaType.DOUBLE;
-    } else if (clazz.equals(Boolean.TYPE) || clazz.equals(Boolean.class)) {
+    } else if (isType(clazz, Boolean.TYPE, Boolean.class)) {
       return OnnxJavaType.BOOL;
     } else if (clazz.equals(String.class)) {
       return OnnxJavaType.STRING;
     } else {
       return OnnxJavaType.UNKNOWN;
     }
+  }
+
+  /**
+   * Checks if the supplied class is either the primitive type or its boxed equivalent.
+   *
+   * @param clazz The class to check.
+   * @param primitive The primitive type.
+   * @param boxed The boxed type.
+   * @return True if the class matches either type.
+   */
+  private static boolean isType(Class<?> clazz, Class<?> primitive, Class<?> boxed) {
+    return clazz.equals(primitive) || clazz.equals(boxed);
   }
 }

@@ -210,59 +210,67 @@ public class OnnxTensor extends OnnxTensorLike {
   public Object getValue() throws OrtException {
     checkClosed();
     if (info.isScalar()) {
-      switch (info.type) {
-        case FLOAT:
-          return getFloat(OnnxRuntime.ortApiHandle, nativeHandle, info.onnxType.value);
-        case DOUBLE:
-          return getDouble(OnnxRuntime.ortApiHandle, nativeHandle);
-        case UINT8:
-        case INT8:
-          return getByte(OnnxRuntime.ortApiHandle, nativeHandle, info.onnxType.value);
-        case INT16:
-          return getShort(OnnxRuntime.ortApiHandle, nativeHandle, info.onnxType.value);
-        case INT32:
-          return getInt(OnnxRuntime.ortApiHandle, nativeHandle, info.onnxType.value);
-        case INT64:
-          return getLong(OnnxRuntime.ortApiHandle, nativeHandle, info.onnxType.value);
-        case BOOL:
-          return getBool(OnnxRuntime.ortApiHandle, nativeHandle);
-        case STRING:
-          return getString(OnnxRuntime.ortApiHandle, nativeHandle);
-        case FLOAT16:
-          return Fp16Conversions.fp16ToFloat(
-              getShort(OnnxRuntime.ortApiHandle, nativeHandle, info.onnxType.value));
-        case BFLOAT16:
-          return Fp16Conversions.bf16ToFloat(
-              getShort(OnnxRuntime.ortApiHandle, nativeHandle, info.onnxType.value));
-        case UNKNOWN:
-        default:
-          throw new OrtException("Extracting the value of an invalid Tensor.");
-      }
+      return getScalarValue();
     } else {
-      Object carrier = info.makeCarrier();
-      if (info.getNumElements() > 0) {
-        // If the tensor has values copy them out
-        if (info.type == OnnxJavaType.STRING) {
-          // We read the strings out from native code in a flat array and then reshape
-          // to the desired output shape if necessary.
-          getStringArray(OnnxRuntime.ortApiHandle, nativeHandle, (String[]) carrier);
-          if (info.shape.length != 1) {
-            carrier = OrtUtil.reshape((String[]) carrier, info.shape);
-          }
-        } else {
-          // Wrap ORT owned memory in buffer, otherwise use our reference
-          Buffer buf;
-          if (buffer == null) {
-            buf = castBuffer(getBuffer());
-          } else {
-            buf = castBuffer(duplicate(buffer));
-          }
-          // Copy out buffer into arrays
-          OrtUtil.fillArrayFromBuffer(info, buf, 0, carrier);
-        }
-      }
-      return carrier;
+      return getArrayValue();
     }
+  }
+
+  private Object getScalarValue() throws OrtException {
+    switch (info.type) {
+      case FLOAT:
+        return getFloat(OnnxRuntime.ortApiHandle, nativeHandle, info.onnxType.value);
+      case DOUBLE:
+        return getDouble(OnnxRuntime.ortApiHandle, nativeHandle);
+      case UINT8:
+      case INT8:
+        return getByte(OnnxRuntime.ortApiHandle, nativeHandle, info.onnxType.value);
+      case INT16:
+        return getShort(OnnxRuntime.ortApiHandle, nativeHandle, info.onnxType.value);
+      case INT32:
+        return getInt(OnnxRuntime.ortApiHandle, nativeHandle, info.onnxType.value);
+      case INT64:
+        return getLong(OnnxRuntime.ortApiHandle, nativeHandle, info.onnxType.value);
+      case BOOL:
+        return getBool(OnnxRuntime.ortApiHandle, nativeHandle);
+      case STRING:
+        return getString(OnnxRuntime.ortApiHandle, nativeHandle);
+      case FLOAT16:
+        return Fp16Conversions.fp16ToFloat(
+            getShort(OnnxRuntime.ortApiHandle, nativeHandle, info.onnxType.value));
+      case BFLOAT16:
+        return Fp16Conversions.bf16ToFloat(
+            getShort(OnnxRuntime.ortApiHandle, nativeHandle, info.onnxType.value));
+      case UNKNOWN:
+      default:
+        throw new OrtException("Extracting the value of an invalid Tensor.");
+    }
+  }
+
+  private Object getArrayValue() throws OrtException {
+    Object carrier = info.makeCarrier();
+    if (info.getNumElements() > 0) {
+      // If the tensor has values copy them out
+      if (info.type == OnnxJavaType.STRING) {
+        // We read the strings out from native code in a flat array and then reshape
+        // to the desired output shape if necessary.
+        getStringArray(OnnxRuntime.ortApiHandle, nativeHandle, (String[]) carrier);
+        if (info.shape.length != 1) {
+          carrier = OrtUtil.reshape((String[]) carrier, info.shape);
+        }
+      } else {
+        // Wrap ORT owned memory in buffer, otherwise use our reference
+        Buffer buf;
+        if (buffer == null) {
+          buf = castBuffer(getBuffer());
+        } else {
+          buf = castBuffer(duplicate(buffer));
+        }
+        // Copy out buffer into arrays
+        OrtUtil.fillArrayFromBuffer(info, buf, 0, carrier);
+      }
+    }
+    return carrier;
   }
 
   @Override
@@ -488,55 +496,59 @@ public class OnnxTensor extends OnnxTensorLike {
    */
   static OnnxTensor createTensor(OrtEnvironment env, OrtAllocator allocator, Object data)
       throws OrtException {
-    if (!allocator.isClosed()) {
-      TensorInfo info = TensorInfo.constructFromJavaArray(data);
-      if (info.type == OnnxJavaType.STRING) {
-        if (info.shape.length == 0) {
-          return new OnnxTensor(
-              createString(OnnxRuntime.ortApiHandle, allocator.handle, (String) data),
-              allocator.handle,
-              info);
-        } else {
-          return new OnnxTensor(
-              createStringTensor(
-                  OnnxRuntime.ortApiHandle,
-                  allocator.handle,
-                  OrtUtil.flattenString(data),
-                  info.shape),
-              allocator.handle,
-              info);
-        }
-      } else {
-        Buffer buf;
-        if (info.shape.length == 0) {
-          buf = OrtUtil.convertBoxedPrimitiveToBuffer(info.type, data);
-          if (buf == null) {
-            throw new OrtException(
-                "Failed to convert a boxed primitive to an array, this is an error with the ORT Java API, please report this message & stack trace. JavaType = "
-                    + info.type
-                    + ", object = "
-                    + data);
-          }
-        } else {
-          buf = OrtUtil.convertArrayToBuffer(info, data);
-        }
-        return new OnnxTensor(
-            createTensorFromBuffer(
-                OnnxRuntime.ortApiHandle,
-                allocator.handle,
-                buf,
-                0,
-                info.type.size * info.numElements,
-                info.shape,
-                info.onnxType.value),
-            allocator.handle,
-            info,
-            buf,
-            true);
-      }
-    } else {
+    if (allocator.isClosed()) {
       throw new IllegalStateException("Trying to create an OnnxTensor with a closed OrtAllocator.");
     }
+    TensorInfo info = TensorInfo.constructFromJavaArray(data);
+    if (info.type == OnnxJavaType.STRING) {
+      return createStringTensorFromObject(allocator, info, data);
+    }
+    return createPrimitiveTensorFromObject(allocator, info, data);
+  }
+
+  private static OnnxTensor createStringTensorFromObject(
+      OrtAllocator allocator, TensorInfo info, Object data) throws OrtException {
+    if (info.shape.length == 0) {
+      return new OnnxTensor(
+          createString(OnnxRuntime.ortApiHandle, allocator.handle, (String) data),
+          allocator.handle,
+          info);
+    }
+    return new OnnxTensor(
+        createStringTensor(
+            OnnxRuntime.ortApiHandle, allocator.handle, OrtUtil.flattenString(data), info.shape),
+        allocator.handle,
+        info);
+  }
+
+  private static OnnxTensor createPrimitiveTensorFromObject(
+      OrtAllocator allocator, TensorInfo info, Object data) throws OrtException {
+    Buffer buf;
+    if (info.shape.length == 0) {
+      buf = OrtUtil.convertBoxedPrimitiveToBuffer(info.type, data);
+      if (buf == null) {
+        throw new OrtException(
+            "Failed to convert a boxed primitive to an array, this is an error with the ORT Java API, please report this message & stack trace. JavaType = "
+                + info.type
+                + ", object = "
+                + data);
+      }
+    } else {
+      buf = OrtUtil.convertArrayToBuffer(info, data);
+    }
+    return new OnnxTensor(
+        createTensorFromBuffer(
+            OnnxRuntime.ortApiHandle,
+            allocator.handle,
+            buf,
+            0,
+            info.type.size * info.numElements,
+            info.shape,
+            info.onnxType.value),
+        allocator.handle,
+        info,
+        buf,
+        true);
   }
 
   /**
