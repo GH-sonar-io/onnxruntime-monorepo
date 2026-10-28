@@ -121,43 +121,39 @@ const conv2dCommonSnippet = (
     }
     return resData;`;
 
-  const sampleX = isChannelsLast
-    ? fitAOuter && fitInner
-      ? `
+  const getSampleXSnippet = () => {
+    const fitX = isChannelsLast ? fitAOuter && fitInner : fitInner && fitBOuter;
+    if (fitX) {
+      return `
     let col = colIn * ${innerElementSizeX};
-    ${readXSnippet}`
-      : `
-    let col = colIn * ${innerElementSizeX};
-    if (row < uniforms.dim_a_outer && col < uniforms.dim_inner) {
-      ${readXSnippet}
+    ${readXSnippet}`;
     }
-    return ${typeSnippet(innerElementSizeX, dataType)}(0.0);`
-    : fitInner && fitBOuter
-      ? `
+    const xBoundsCheck = isChannelsLast
+      ? 'row < uniforms.dim_a_outer && col < uniforms.dim_inner'
+      : 'row < uniforms.dim_inner && col < uniforms.dim_b_outer';
+    return `
     let col = colIn * ${innerElementSizeX};
-    ${readXSnippet}`
-      : `
-    let col = colIn * ${innerElementSizeX};
-    if (row < uniforms.dim_inner && col < uniforms.dim_b_outer) {
+    if (${xBoundsCheck}) {
       ${readXSnippet}
     }
     return ${typeSnippet(innerElementSizeX, dataType)}(0.0);`;
+  };
 
-  const sampleW = isChannelsLast
-    ? fitInner && fitBOuter
-      ? getWSnippet(innerElementSizeW)
-      : `
-    let col = colIn * ${innerElementSizeW};
-    if (row < uniforms.dim_inner && col < uniforms.dim_b_outer) {
-      ${getWSnippet(innerElementSizeW)}
+  const getSampleWSnippet = () => {
+    if (isChannelsLast && fitInner && fitBOuter) {
+      return getWSnippet(innerElementSizeW);
     }
-    return ${typeSnippet(innerElementSizeW, dataType)}(0.0);`
-    : `
+    const wOuterDim = isChannelsLast ? 'uniforms.dim_b_outer' : 'uniforms.dim_a_outer';
+    return `
     let col = colIn * ${innerElementSizeW};
-    if (row < uniforms.dim_inner && col < uniforms.dim_a_outer) {
+    if (row < uniforms.dim_inner && col < ${wOuterDim}) {
       ${getWSnippet(innerElementSizeW)}
     }
     return ${typeSnippet(innerElementSizeW, dataType)}(0.0);`;
+  };
+
+  const sampleX = getSampleXSnippet();
+  const sampleW = getSampleWSnippet();
 
   const resType = typeSnippet(innerElementSize, dataType);
   const aType = isChannelsLast ? typeSnippet(innerElementSizeX, dataType) : typeSnippet(innerElementSizeW, dataType);

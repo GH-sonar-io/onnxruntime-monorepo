@@ -62,14 +62,8 @@ export const createConvTranspose2DProgramInfo = (
   const filterDims = [attributes.kernelShape[isChannelsLast ? 1 : 2], attributes.kernelShape[isChannelsLast ? 2 : 3]];
   const dilations = [attributes.dilations[0], attributes.dilations[1]];
   const effectiveFilterDims = [
-    filterDims[0] +
-      (attributes.dilations[0] <= 1
-        ? 0
-        : (attributes.kernelShape[isChannelsLast ? 1 : 2] - 1) * (attributes.dilations[0] - 1)),
-    filterDims[1] +
-      (attributes.dilations[1] <= 1
-        ? 0
-        : (attributes.kernelShape[isChannelsLast ? 2 : 3] - 1) * (attributes.dilations[1] - 1)),
+    filterDims[0] + (attributes.dilations[0] <= 1 ? 0 : (filterDims[0] - 1) * (attributes.dilations[0] - 1)),
+    filterDims[1] + (attributes.dilations[1] <= 1 ? 0 : (filterDims[1] - 1) * (attributes.dilations[1] - 1)),
   ];
   const pads = [
     effectiveFilterDims[0] - 1 - Math.floor((attributes.pads[0] + attributes.pads[2]) / 2),

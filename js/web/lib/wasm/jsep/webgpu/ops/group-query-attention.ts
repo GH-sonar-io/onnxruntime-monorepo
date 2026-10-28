@@ -23,18 +23,10 @@ export interface GroupQueryAttentionAttributes {
   localWindowSize: number;
 }
 
-export const validateInputs = (
-  inputs: readonly TensorView[],
-  attributes: GroupQueryAttentionAttributes,
-): AttentionParameters => {
+const validateAttributes = (inputs: readonly TensorView[], attributes: GroupQueryAttentionAttributes): void => {
   if (attributes.doRotary && inputs.length <= 7) {
     throw new Error('cos_cache and sin_cache inputs are required if do_rotary is specified');
   }
-  const query = inputs[0];
-  const key = inputs[1];
-  const value = inputs[2];
-  const pastKey = inputs[3];
-  const pastValue = inputs[4];
   if (attributes.doRotary !== 0 && inputs.length <= 7) {
     throw new Error('cos_cast and sin_cache are expected if do_rotary attribute is non-zero');
   }
@@ -50,6 +42,146 @@ export const validateInputs = (
   if (attributes.smoothSoftmax) {
     throw new Error('Smooth softmax is not supported');
   }
+};
+
+const validatePastKeyValue = (
+  pastKey: TensorView | undefined,
+  pastValue: TensorView | undefined,
+  batchSize: number,
+  headSize: number,
+  attributes: GroupQueryAttentionAttributes,
+): number => {
+  const hasPastKey = !!pastKey && pastKey.dims.length !== 0;
+  const hasPastValue = !!pastValue && pastValue.dims.length !== 0;
+  // Currently the onnxruntime GQA specification only support key/value BNSH format.
+  const isPastkvBSNH =
+    hasPastKey &&
+    pastKey.dims.length === 4 &&
+    pastKey.dims[0] === batchSize &&
+    pastKey.dims[1] !== attributes.kvNumHeads &&
+    pastKey.dims[2] === attributes.kvNumHeads &&
+    pastKey.dims[3] === headSize;
+
+  if (isPastkvBSNH) {
+    throw new Error('BSNH pastKey/pastValue is not supported');
+  }
+  if (hasPastKey && hasPastValue) {
+    if (pastKey.dims.length !== 4) {
+      throw new Error('Input "past_key" is expected to have 4 dimensions');
+    }
+    if (pastValue.dims.length !== 4) {
+      throw new Error('Input "past_value" is expected to have 4 dimensions');
+    }
+    return pastKey.dims[2];
+  }
+  if (hasPastKey || hasPastValue) {
+    throw new Error('Input "past_key" and "past_value" shall be both present or both absent');
+  }
+  return 0;
+};
+
+const validateKey = (
+  query: TensorView,
+  key: TensorView,
+  value: TensorView | undefined,
+  headSize: number,
+  attributes: GroupQueryAttentionAttributes,
+): number => {
+  if (query.dims.length !== 3) {
+    throw new Error('Input "query" is expected to have 3 dimensions when key is given');
+  }
+  if (key.dims.length < 3 || key.dims.length > 5) {
+    throw new Error('Input "key" is expected to have 3, 4, or 5 dimensions');
+  }
+  if (query.dims[0] !== key.dims[0]) {
+    throw new Error('Input "query" and "key" shall have same dim 0 (batch size)');
+  }
+
+  if (key.dims.length === 3) {
+    if (query.dims[2] % key.dims[2] !== 0) {
+      throw new Error('Dimension 2 of "query" should be a multiple of "key"');
+    }
+    return key.dims[1];
+  }
+  if (key.dims.length === 5) {
+    if (key.dims[2] !== attributes.numHeads || key.dims[3] !== 2 || key.dims[4] !== headSize) {
+      throw new Error('Expect "key" shape (batch_size, kv_sequence_length, num_heads, 2, head_size) for packed kv');
+    }
+    if (value) {
+      throw new Error('Expect "value" be none when "key" has packed kv format.');
+    }
+    return key.dims[1];
+  }
+  // key_dims.size() == 4 (cross-attention with past_key)
+  if (key.dims[1] !== attributes.numHeads || key.dims[3] !== headSize) {
+    throw new Error('Expect "key" shape (batch_size, num_heads, kv_sequence_length, head_size) for past_key');
+  }
+  return key.dims[2];
+};
+
+const validatePackedQuery = (query: TensorView, attributes: GroupQueryAttentionAttributes): void => {
+  if (query.dims.length !== 3 && query.dims.length !== 5) {
+    throw new Error('Input "query" is expected to have 3 or 5 dimensions when key is empty');
+  }
+  if (query.dims.length === 5 && (query.dims[2] !== attributes.numHeads || query.dims[3] !== 3)) {
+    throw new Error('Expect "query" shape (batch_size, kv_sequence_length, num_heads, 3, head_size) for packed kv');
+  }
+};
+
+const validateValue = (
+  query: TensorView,
+  value: TensorView,
+  kvSequenceLength: number,
+): { vHiddenSize: number; passPastInKv: boolean } => {
+  if (value.dims.length !== 3 && value.dims.length !== 4) {
+    throw new Error('Input "value" is expected to have 3 or 4 dimensions');
+  }
+
+  if (query.dims[0] !== value.dims[0]) {
+    throw new Error('Input "query" and "value" shall have same dim 0 (batch_size)');
+  }
+
+  if (value.dims.length === 3) {
+    if (kvSequenceLength !== value.dims[1]) {
+      throw new Error('Input "key" and "value" shall have the same dim 1 (kv_sequence_length)');
+    }
+    return { vHiddenSize: value.dims[2], passPastInKv: false };
+  }
+  if (kvSequenceLength !== value.dims[2]) {
+    throw new Error('Input "past_key" and "past_value" shall have the same dim 2 (kv_sequence_length)');
+  }
+  return { vHiddenSize: value.dims[1] * value.dims[3], passPastInKv: true };
+};
+
+// Spec requires 1D shape (batch_size), but older model builders may add unit
+// dimensions (e.g. [B, 1] instead of [B]). Allow shapes where each dim is 1 or batchSize.
+const validateSeqlLens = (seqlLens: TensorView, batchSize: number): void => {
+  if (seqlLens.dims.length === 0) {
+    throw new Error('seqlens_k must be at least 1D, got scalar.');
+  }
+  const seqlLenSize = seqlLens.dims.reduce((a, b) => a * b, 1);
+  if (seqlLenSize !== batchSize) {
+    throw new Error(`seqlens_k must have batch_size (${batchSize}) elements, got ${seqlLenSize}.`);
+  }
+  for (let i = 0; i < seqlLens.dims.length; i++) {
+    if (seqlLens.dims[i] !== 1 && seqlLens.dims[i] !== batchSize) {
+      throw new Error(
+        `seqlens_k has unexpected shape. Each dimension must be 1 or batch_size (${batchSize}), got dims[${i}] = ${seqlLens.dims[i]}.`,
+      );
+    }
+  }
+};
+
+export const validateInputs = (
+  inputs: readonly TensorView[],
+  attributes: GroupQueryAttentionAttributes,
+): AttentionParameters => {
+  validateAttributes(inputs, attributes);
+  const query = inputs[0];
+  const key = inputs[1];
+  const value = inputs[2];
+  const pastKey = inputs[3];
+  const pastValue = inputs[4];
   // Abbreviation and Meanings:
   //   B:    batch_size
   //   S:    sequence_length (input sequence length of query)
@@ -88,9 +220,6 @@ export const validateInputs = (
   const sequenceLength = query.dims[1];
   let hiddenSize =
     query.dims.length === 3 ? (dmmhaPacking ? query.dims[2] / 3 : query.dims[2]) : attributes.numHeads * query.dims[4];
-  let kvSequenceLength = sequenceLength;
-
-  let pastSequenceLength = 0;
   const packedQKV = !key || key.dims.length === 0;
   const headSize = !packedQKV
     ? Math.floor(hiddenSize / attributes.numHeads)
@@ -98,119 +227,23 @@ export const validateInputs = (
   if (packedQKV) {
     hiddenSize = headSize * attributes.numHeads;
   }
-  const hasPastKey = pastKey && pastKey.dims.length !== 0;
-  const hasPastValue = pastValue && pastValue.dims.length !== 0;
-  // Currently the onnxruntime GQA specification only support key/value BNSH format.
-  const isPastkvBSNH =
-    hasPastKey &&
-    pastKey.dims.length === 4 &&
-    pastKey.dims[0] === batchSize &&
-    pastKey.dims[1] !== attributes.kvNumHeads &&
-    pastKey.dims[2] === attributes.kvNumHeads &&
-    pastKey.dims[3] === headSize;
+  const pastSequenceLength = validatePastKeyValue(pastKey, pastValue, batchSize, headSize, attributes);
 
-  if (isPastkvBSNH) {
-    throw new Error('BSNH pastKey/pastValue is not supported');
+  if (packedQKV) {
+    validatePackedQuery(query, attributes);
   }
-  if (hasPastKey && hasPastValue) {
-    if (pastKey.dims.length !== 4) {
-      throw new Error('Input "past_key" is expected to have 4 dimensions');
-    }
-    if (pastValue.dims.length !== 4) {
-      throw new Error('Input "past_value" is expected to have 4 dimensions');
-    }
-    pastSequenceLength = pastKey.dims[2];
-  } else if (hasPastKey || hasPastValue) {
-    throw new Error('Input "past_key" and "past_value" shall be both present or both absent');
-  }
-
-  let qkvFormat: AttentionQkvFormat = AttentionQkvFormat.qkvBNSH;
-  if (key && key.dims.length > 0) {
-    if (query.dims.length !== 3) {
-      throw new Error('Input "query" is expected to have 3 dimensions when key is given');
-    }
-    if (key.dims.length < 3 || key.dims.length > 5) {
-      throw new Error('Input "key" is expected to have 3, 4, or 5 dimensions');
-    }
-    if (query.dims[0] !== key.dims[0]) {
-      throw new Error('Input "query" and "key" shall have same dim 0 (batch size)');
-    }
-
-    if (key.dims.length === 3) {
-      if (query.dims[2] % key.dims[2] !== 0) {
-        throw new Error('Dimension 2 of "query" should be a multiple of "key"');
-      }
-      kvSequenceLength = key.dims[1];
-    } else if (key.dims.length === 5) {
-      if (key.dims[2] !== attributes.numHeads || key.dims[3] !== 2 || key.dims[4] !== headSize) {
-        throw new Error('Expect "key" shape (batch_size, kv_sequence_length, num_heads, 2, head_size) for packed kv');
-      }
-      if (value) {
-        throw new Error('Expect "value" be none when "key" has packed kv format.');
-      }
-      kvSequenceLength = key.dims[1];
-    } else {
-      // key_dims.size() == 4 (cross-attention with past_key)
-      if (key.dims[1] !== attributes.numHeads || key.dims[3] !== headSize) {
-        throw new Error('Expect "key" shape (batch_size, num_heads, kv_sequence_length, head_size) for past_key');
-      }
-      kvSequenceLength = key.dims[2];
-    }
-  } else {
-    // packed QKV
-    if (query.dims.length !== 3 && query.dims.length !== 5) {
-      throw new Error('Input "query" is expected to have 3 or 5 dimensions when key is empty');
-    }
-    if (query.dims.length === 5 && (query.dims[2] !== attributes.numHeads || query.dims[3] !== 3)) {
-      throw new Error('Expect "query" shape (batch_size, kv_sequence_length, num_heads, 3, head_size) for packed kv');
-    }
-
-    qkvFormat = AttentionQkvFormat.qkvBSN3H;
-  }
+  const kvSequenceLength = packedQKV ? sequenceLength : validateKey(query, key, value, headSize, attributes);
+  const qkvFormat: AttentionQkvFormat = packedQKV ? AttentionQkvFormat.qkvBSN3H : AttentionQkvFormat.qkvBNSH;
 
   const maskType: AttentionMaskType = AttentionMaskType.none;
   let passPastInKv = false;
   let vHiddenSize = attributes.kvNumHeads ? headSize * attributes.kvNumHeads : hiddenSize;
   if (value && value.dims.length > 0) {
-    if (value.dims.length !== 3 && value.dims.length !== 4) {
-      throw new Error('Input "value" is expected to have 3 or 4 dimensions');
-    }
-
-    if (query.dims[0] !== value.dims[0]) {
-      throw new Error('Input "query" and "value" shall have same dim 0 (batch_size)');
-    }
-
-    if (value.dims.length === 3) {
-      if (kvSequenceLength !== value.dims[1]) {
-        throw new Error('Input "key" and "value" shall have the same dim 1 (kv_sequence_length)');
-      }
-      vHiddenSize = value.dims[2];
-    } else {
-      if (kvSequenceLength !== value.dims[2]) {
-        throw new Error('Input "past_key" and "past_value" shall have the same dim 2 (kv_sequence_length)');
-      }
-      vHiddenSize = value.dims[1] * value.dims[3];
-      passPastInKv = true;
-    }
+    ({ vHiddenSize, passPastInKv } = validateValue(query, value, kvSequenceLength));
   }
-  // Spec requires 1D shape (batch_size), but older model builders may add unit
-  // dimensions (e.g. [B, 1] instead of [B]). Allow shapes where each dim is 1 or batchSize.
   const seqlLens = inputs.length > 4 ? inputs[5] : undefined;
   if (seqlLens) {
-    if (seqlLens.dims.length === 0) {
-      throw new Error('seqlens_k must be at least 1D, got scalar.');
-    }
-    const seqlLenSize = seqlLens.dims.reduce((a, b) => a * b, 1);
-    if (seqlLenSize !== batchSize) {
-      throw new Error(`seqlens_k must have batch_size (${batchSize}) elements, got ${seqlLenSize}.`);
-    }
-    for (let i = 0; i < seqlLens.dims.length; i++) {
-      if (seqlLens.dims[i] !== 1 && seqlLens.dims[i] !== batchSize) {
-        throw new Error(
-          `seqlens_k has unexpected shape. Each dimension must be 1 or batch_size (${batchSize}), got dims[${i}] = ${seqlLens.dims[i]}.`,
-        );
-      }
-    }
+    validateSeqlLens(seqlLens, batchSize);
   }
   const totalSequenceLength = -1;
   const maxSequenceLength = -1;
@@ -327,17 +360,24 @@ const generatePositionIdsProgramInfo = (
   };
 };
 
-export const groupQueryAttention = (context: ComputeContext, attributes: GroupQueryAttentionAttributes): void => {
+const validateNoNormWeightInputs = (inputs: readonly TensorView[]): void => {
   // q_norm_weight (input 14) / k_norm_weight (input 15) are emitted by the CUDA/native WebGPU
   // GroupQueryAttentionPreNormFusion optimizer pass. JSEP does not implement the fused
   // per-head Q/K RMS normalization prologue, so reject the node if either input is present
   // (regardless of rank, including scalars) rather than silently dropping the normalization.
-  if ((context.inputs.length > 14 && context.inputs[14]) || (context.inputs.length > 15 && context.inputs[15])) {
+  if ((inputs.length > 14 && inputs[14]) || (inputs.length > 15 && inputs[15])) {
     throw new Error(
       'GroupQueryAttention (JSEP): q_norm_weight / k_norm_weight inputs are not supported. ' +
         'The per-head Q/K RMS normalization prologue is implemented only on the CUDA and native WebGPU EPs.',
     );
   }
+};
+
+const getNonEmptyInput = (inputs: readonly TensorView[], index: number): TensorView | undefined =>
+  inputs[index] && inputs[index].dims.length > 0 ? inputs[index] : undefined;
+
+export const groupQueryAttention = (context: ComputeContext, attributes: GroupQueryAttentionAttributes): void => {
+  validateNoNormWeightInputs(context.inputs);
   const params = validateInputs(context.inputs, attributes);
   if (context.inputs[0].dims.length === 5) {
     throw new Error('Packed QKV is not implemented');
@@ -348,10 +388,10 @@ export const groupQueryAttention = (context: ComputeContext, attributes: GroupQu
   }
 
   const q = context.inputs[0];
-  const k = context.inputs[1] && context.inputs[1].dims.length > 0 ? context.inputs[1] : undefined;
-  const v = context.inputs[2] && context.inputs[2].dims.length > 0 ? context.inputs[2] : undefined;
-  const pastKey = context.inputs[3] && context.inputs[3].dims.length !== 0 ? context.inputs[3] : undefined;
-  const pastValue = context.inputs[4] && context.inputs[4].dims.length !== 0 ? context.inputs[4] : undefined;
+  const k = getNonEmptyInput(context.inputs, 1);
+  const v = getNonEmptyInput(context.inputs, 2);
+  const pastKey = getNonEmptyInput(context.inputs, 3);
+  const pastValue = getNonEmptyInput(context.inputs, 4);
   const seqLens = context.inputs.length > 4 ? context.inputs[5] : undefined;
   const totalSequenceLengthInput = context.inputs.length > 5 ? context.inputs[6] : undefined;
   const kvNumHeads = params.kvNumHeads ? params.kvNumHeads : params.numHeads;

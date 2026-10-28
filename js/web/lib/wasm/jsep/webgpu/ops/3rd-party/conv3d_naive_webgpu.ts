@@ -310,6 +310,9 @@ export const createConv3DNaiveProgramInfo = (
   }
   programUniforms.push(...createTensorShapeVariables(outputShape));
 
+  const selectByLayout = (channelsLastValue: string, channelsFirstValue: string) =>
+    isChannelLast ? channelsLastValue : channelsFirstValue;
+
   const getShaderSource = (shaderHelper: ShaderHelper) => {
     const uniforms: UniformsArrayType = [
       { name: 'output_size', type: 'u32' },
@@ -338,7 +341,7 @@ export const createConv3DNaiveProgramInfo = (
       inputVariables.push(bias);
       declareFunctions += `
         fn getBiasByOutputCoords(coords : array<u32, 5>) -> ${isVec4 ? `vec4<${t}>` : t} {
-          return bias[${isChannelLast ? getElementAt('coords', 4, 5) : getElementAt('coords', 1, 5)}${
+          return bias[${selectByLayout(getElementAt('coords', 4, 5), getElementAt('coords', 1, 5))}${
             isVec4 ? '/ 4' : ''
           }];
         }`;
@@ -361,39 +364,38 @@ export const createConv3DNaiveProgramInfo = (
           ${shaderHelper.guardAgainstOutOfBoundsWorkgroupSizes('uniforms.output_size')}
               let coords = ${output.offsetToIndices('global_idx')};
               let batch = ${getElementAt('coords', 0, x.rank)};
-              let d2 = ${
-                isChannelLast ? getElementAt('coords', x.rank - 1, x.rank) : getElementAt('coords', 1, x.rank)
-              };
-              let xFRCCorner = vec3<u32>(${
-                isChannelLast ? getElementAt('coords', 1, x.rank) : getElementAt('coords', 2, x.rank)
-              },
-              ${isChannelLast ? getElementAt('coords', 2, x.rank) : getElementAt('coords', 3, x.rank)},
-              ${
-                isChannelLast ? getElementAt('coords', 3, x.rank) : getElementAt('coords', 4, x.rank)
-              }) * uniforms.strides - uniforms.pads;
+              let d2 = ${selectByLayout(
+                getElementAt('coords', x.rank - 1, x.rank),
+                getElementAt('coords', 1, x.rank),
+              )};
+              let xFRCCorner = vec3<u32>(${selectByLayout(
+                getElementAt('coords', 1, x.rank),
+                getElementAt('coords', 2, x.rank),
+              )},
+              ${selectByLayout(getElementAt('coords', 2, x.rank), getElementAt('coords', 3, x.rank))},
+              ${selectByLayout(
+                getElementAt('coords', 3, x.rank),
+                getElementAt('coords', 4, x.rank),
+              )}) * uniforms.strides - uniforms.pads;
               let xFCorner = xFRCCorner.x;
               let xRCorner = xFRCCorner.y;
               let xCCorner = xFRCCorner.z;
-              let xShapeY = ${
-                isChannelLast
-                  ? getElementAt('uniforms.x_shape', 1, x.rank)
-                  : getElementAt('uniforms.x_shape', 2, x.rank)
-              };
-              let xShapeZ = ${
-                isChannelLast
-                  ? getElementAt('uniforms.x_shape', 2, x.rank)
-                  : getElementAt('uniforms.x_shape', 3, x.rank)
-              };
-              let xShapeW = ${
-                isChannelLast
-                  ? getElementAt('uniforms.x_shape', 3, x.rank)
-                  : getElementAt('uniforms.x_shape', 4, x.rank)
-              };
-              let xShapeU = ${
-                isChannelLast
-                  ? getElementAt('uniforms.x_shape', 4, x.rank)
-                  : getElementAt('uniforms.x_shape', 1, x.rank)
-              };
+              let xShapeY = ${selectByLayout(
+                getElementAt('uniforms.x_shape', 1, x.rank),
+                getElementAt('uniforms.x_shape', 2, x.rank),
+              )};
+              let xShapeZ = ${selectByLayout(
+                getElementAt('uniforms.x_shape', 2, x.rank),
+                getElementAt('uniforms.x_shape', 3, x.rank),
+              )};
+              let xShapeW = ${selectByLayout(
+                getElementAt('uniforms.x_shape', 3, x.rank),
+                getElementAt('uniforms.x_shape', 4, x.rank),
+              )};
+              let xShapeU = ${selectByLayout(
+                getElementAt('uniforms.x_shape', 4, x.rank),
+                getElementAt('uniforms.x_shape', 1, x.rank),
+              )};
               let inputDepthNearestVec4 = (xShapeU / 4) * 4;
               let inputDepthVec4Remainder = xShapeU % 4;
 
@@ -417,21 +419,20 @@ export const createConv3DNaiveProgramInfo = (
                     }
 
                     for (var d1 = 0u; d1 < inputDepthNearestVec4; d1 += 4) {
-                      ${
-                        isChannelLast
-                          ? `let xValues = vec4<${t}>(
+                      ${selectByLayout(
+                        `let xValues = vec4<${t}>(
                                getX(batch, xF, xR, xC, d1),
                                getX(batch, xF, xR, xC, d1 + 1),
                                getX(batch, xF, xR, xC, d1 + 2),
                                getX(batch, xF, xR, xC, d1 + 3));
-                            `
-                          : `let xValues = vec4<${t}>(
+                            `,
+                        `let xValues = vec4<${t}>(
                                getX(batch, d1, xF, xR, xC),
                                getX(batch, d1 + 1, xF, xR, xC),
                                getX(batch, d1 + 2, xF, xR, xC),
                                getX(batch, d1 + 3, xF, xR, xC));
-                            `
-                      }
+                            `,
+                      )}
                             let wValues = vec4<${t}>(
                               getW(d2, d1, wF, wR, wC),
                               getW(d2, d1 + 1, wF, wR, wC),
@@ -440,43 +441,40 @@ export const createConv3DNaiveProgramInfo = (
                       value += dot(xValues, wValues);
                     }
                     if (inputDepthVec4Remainder == 1) {
-                        ${
-                          isChannelLast
-                            ? `value += getX(batch, xF, xR, xC, inputDepthNearestVec4)
-                          * getW(d2, inputDepthNearestVec4, wF, wR, wC);`
-                            : `value += getX(batch, inputDepthNearestVec4, xF, xR, xC)
-                          * getW(d2, inputDepthNearestVec4, wF, wR, wC);`
-                        }
+                        ${selectByLayout(
+                          `value += getX(batch, xF, xR, xC, inputDepthNearestVec4)
+                          * getW(d2, inputDepthNearestVec4, wF, wR, wC);`,
+                          `value += getX(batch, inputDepthNearestVec4, xF, xR, xC)
+                          * getW(d2, inputDepthNearestVec4, wF, wR, wC);`,
+                        )}
                     } else if (inputDepthVec4Remainder == 2) {
-                      ${
-                        isChannelLast
-                          ? `let xValues = vec2<${t}>(
+                      ${selectByLayout(
+                        `let xValues = vec2<${t}>(
                         getX(batch, xF, xR, xC, inputDepthNearestVec4),
                         getX(batch, xF, xR, xC, inputDepthNearestVec4 + 1));
-                      `
-                          : `let xValues = vec2<${t}>(
+                      `,
+                        `let xValues = vec2<${t}>(
                         getX(batch, inputDepthNearestVec4, xF, xR, xC),
                         getX(batch, inputDepthNearestVec4 + 1, xF, xR, xC));
-                    `
-                      }
+                    `,
+                      )}
                     let wValues = vec2<${t}>(
                       getW(d2, inputDepthNearestVec4, wF, wR, wC),
                       getW(d2, inputDepthNearestVec4 + 1, wF, wR, wC));
                       value += dot(xValues, wValues);
                     } else if (inputDepthVec4Remainder == 3) {
-                      ${
-                        isChannelLast
-                          ? `let xValues = vec3<${t}>(
+                      ${selectByLayout(
+                        `let xValues = vec3<${t}>(
                         getX(batch, xF, xR, xC, inputDepthNearestVec4),
                         getX(batch, xF, xR, xC, inputDepthNearestVec4 + 1),
                         getX(batch, xF, xR, xC, inputDepthNearestVec4 + 2));
-                      `
-                          : `let xValues = vec3<${t}>(
+                      `,
+                        `let xValues = vec3<${t}>(
                         getX(batch, inputDepthNearestVec4, xF, xR, xC),
                         getX(batch, inputDepthNearestVec4 + 1, xF, xR, xC),
                         getX(batch, inputDepthNearestVec4 + 2, xF, xR, xC));
-                    `
-                      }
+                    `,
+                      )}
                     let wValues = vec3<${t}>(
                       getW(d2, inputDepthNearestVec4, wF, wR, wC),
                       getW(d2, inputDepthNearestVec4 + 1, wF, wR, wC),
