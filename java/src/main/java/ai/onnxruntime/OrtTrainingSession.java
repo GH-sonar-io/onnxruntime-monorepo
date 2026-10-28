@@ -541,22 +541,7 @@ public final class OrtTrainingSession implements AutoCloseable {
                 + trainOutputNames.toString());
       }
     }
-    for (String s : requestedOutputs) {
-      if (trainOutputNames.contains(s)) {
-        if (!pinnedOutputs.containsKey(s)) {
-          outputNamesArray[i] = s;
-          // outputValues and outputHandles can be null/0 for these outputs as ORT will allocate
-          // them.
-          i++;
-        } else {
-          throw new OrtException(
-              "Output '" + s + "' was found in both the requested outputs and the pinned outputs");
-        }
-      } else {
-        throw new OrtException(
-            "Unknown output name " + s + ", expected one of " + trainOutputNames.toString());
-      }
-    }
+    addRequestedOutputNames(requestedOutputs, pinnedOutputs, outputNamesArray, i);
     long runOptionsHandle = runOptions == null ? 0 : runOptions.getNativeHandle();
 
     boolean[] ownedByResult =
@@ -574,6 +559,38 @@ public final class OrtTrainingSession implements AutoCloseable {
             outputHandles,
             runOptionsHandle);
     return new OrtSession.Result(outputNamesArray, outputValues, ownedByResult);
+  }
+
+  /**
+   * Validates the requested output names and writes them into the output names array starting at
+   * the supplied offset.
+   *
+   * @param requestedOutputs The requested outputs which ORT will allocate.
+   * @param pinnedOutputs The requested outputs which the user has allocated.
+   * @param outputNamesArray The output names array to fill.
+   * @param offset The first index to write into.
+   * @throws OrtException If an output name is unknown or also present in the pinned outputs.
+   */
+  private void addRequestedOutputNames(
+      Set<String> requestedOutputs,
+      Map<String, ? extends OnnxValue> pinnedOutputs,
+      String[] outputNamesArray,
+      int offset)
+      throws OrtException {
+    int i = offset;
+    for (String s : requestedOutputs) {
+      if (!trainOutputNames.contains(s)) {
+        throw new OrtException(
+            "Unknown output name " + s + ", expected one of " + trainOutputNames.toString());
+      }
+      if (pinnedOutputs.containsKey(s)) {
+        throw new OrtException(
+            "Output '" + s + "' was found in both the requested outputs and the pinned outputs");
+      }
+      outputNamesArray[i] = s;
+      // outputValues and outputHandles can be null/0 for these outputs as ORT will allocate them.
+      i++;
+    }
   }
 
   /*
@@ -741,22 +758,7 @@ public final class OrtTrainingSession implements AutoCloseable {
                 + evalOutputNames.toString());
       }
     }
-    for (String s : requestedOutputs) {
-      if (evalOutputNames.contains(s)) {
-        if (!pinnedOutputs.containsKey(s)) {
-          outputNamesArray[i] = s;
-          // outputValues and outputHandles can be null/0 for these outputs as ORT will allocate
-          // them.
-          i++;
-        } else {
-          throw new OrtException(
-              "Output '" + s + "' was found in both the requested outputs and the pinned outputs");
-        }
-      } else {
-        throw new OrtException(
-            "Unknown output name " + s + ", expected one of " + evalOutputNames.toString());
-      }
-    }
+    fillRequestedEvalOutputs(requestedOutputs, pinnedOutputs, outputNamesArray, i);
     long runOptionsHandle = runOptions == null ? 0 : runOptions.getNativeHandle();
 
     boolean[] ownedByResult =
@@ -774,6 +776,39 @@ public final class OrtTrainingSession implements AutoCloseable {
             outputHandles,
             runOptionsHandle);
     return new OrtSession.Result(outputNamesArray, outputValues, ownedByResult);
+  }
+
+  /**
+   * Validates the requested eval outputs and writes their names into the output names array,
+   * starting at the supplied offset.
+   *
+   * @param requestedOutputs The requested outputs which ORT will allocate.
+   * @param pinnedOutputs The requested outputs which the user has allocated.
+   * @param outputNamesArray The output names array to fill.
+   * @param offset The first index to write into.
+   * @throws OrtException If an output name is unknown or also present in the pinned outputs.
+   */
+  private void fillRequestedEvalOutputs(
+      Set<String> requestedOutputs,
+      Map<String, ? extends OnnxValue> pinnedOutputs,
+      String[] outputNamesArray,
+      int offset)
+      throws OrtException {
+    int i = offset;
+    for (String s : requestedOutputs) {
+      if (!evalOutputNames.contains(s)) {
+        throw new OrtException(
+            "Unknown output name " + s + ", expected one of " + evalOutputNames.toString());
+      }
+      if (pinnedOutputs.containsKey(s)) {
+        throw new OrtException(
+            "Output '" + s + "' was found in both the requested outputs and the pinned outputs");
+      }
+      outputNamesArray[i] = s;
+      // outputValues and outputHandles can be null/0 for these outputs as ORT will allocate
+      // them.
+      i++;
+    }
   }
 
   /*
